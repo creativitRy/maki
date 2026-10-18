@@ -42,15 +42,19 @@ pub fn load_session_response() -> LoadSessionResponse {
     LoadSessionResponse::new().modes(mode_state(MODE_BUILD))
 }
 
+fn display_name(spec: &str) -> &str {
+    spec.split_once('/').map_or(spec, |(_, model_id)| model_id)
+}
+
 pub fn model_config_option(current: &str, specs: &[String]) -> SessionConfigOption {
     let mut options: Vec<SessionConfigSelectOption> = specs
         .iter()
-        .map(|spec| SessionConfigSelectOption::new(spec.clone(), spec.clone()))
+        .map(|spec| SessionConfigSelectOption::new(spec.clone(), display_name(spec)))
         .collect();
     if !specs.iter().any(|spec| spec == current) {
         options.insert(
             0,
-            SessionConfigSelectOption::new(current.to_string(), current.to_string()),
+            SessionConfigSelectOption::new(current.to_string(), display_name(current)),
         );
     }
     SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current.to_string(), options)
