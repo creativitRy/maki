@@ -202,6 +202,8 @@ fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
 
 /// Discovery lands in batches after the client built its selector from the
 /// offline list, so every batch that adds something announces the fuller list.
+/// A batch also re-resolves the running model: a provider that only lists its
+/// windows over the wire learns them here, with no new spec to show for it.
 fn refresh_models(srv: &mut Server, batch: Vec<String>) {
     let known = srv.model_specs.len();
     for spec in batch {
@@ -209,11 +211,14 @@ fn refresh_models(srv: &mut Server, batch: Vec<String>) {
             srv.model_specs.push(spec);
         }
     }
+    // Merged even with no session yet, since session/new builds its selector from this list.
+    let Some(session) = &srv.session else { return };
+    if let Ok(model) = Model::from_spec(&session.current_model) {
+        let _ = session.handle.model_tx.send(model);
+    }
     if srv.model_specs.len() == known {
         return;
     }
-    // Merged even with no session yet, since session/new builds its selector from this list.
-    let Some(session) = &srv.session else { return };
     let option = methods::model_config_option(&session.current_model, &srv.model_specs);
     session_update(
         &srv.out_tx,
@@ -471,8 +476,11 @@ fn start_session(
     // MCP config all follow the session's project, not ours.
     let project_trusted = project_config.is_trusted();
     let permissions_config = maki_config::load_permissions(&project_config);
+    // Discovery can land between process start and a session, and for a provider
+    // that only lists its windows over the wire it is the only source of one.
+    let model = Model::from_spec(&params.model.spec()).unwrap_or_else(|_| params.model.clone());
     let (handle, events) = headless::spawn_interactive(InteractiveParams {
-        model: params.model.clone(),
+        model,
         config: params.config.clone(),
         permissions_config,
         timeouts: params.timeouts,
@@ -1387,16 +1395,24 @@ mod tests {
         assert_eq!(permission_answer(&raw), expected);
     }
 
-    fn test_server() -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
+    type TestServer = (
+        Server,
+        flume::Receiver<String>,
+        flume::Receiver<Value>,
+        flume::Receiver<Model>,
+    );
+
+    fn test_server() -> TestServer {
         let (answer_tx, answer_rx) = flume::unbounded();
         let (out_tx, out_rx) = flume::unbounded();
+        let (model_tx, model_rx) = flume::unbounded();
         let claim = SessionClaim::fresh(&StateDir::from_path(FIXTURE_CLAIMS.path().to_path_buf()));
         let handle = InteractiveHandle {
             tool_names: Vec::new(),
             input_tx: flume::unbounded().0,
             answer_tx,
             cancel_tx: flume::unbounded().0,
-            model_tx: flume::unbounded().0,
+            model_tx,
             mode_tx: flume::unbounded().0,
             session_id: SessionRef::from(claim.id()),
             permissions: Arc::new(PermissionManager::new(
@@ -1424,7 +1440,7 @@ mod tests {
                 claim,
             }),
         };
-        (server, answer_rx, out_rx)
+        (server, answer_rx, out_rx, model_rx)
     }
 
     fn acp_params(storage: StateDir) -> AcpParams {
@@ -1471,7 +1487,7 @@ mod tests {
             true => stored.id,
             false => MakiId::generate(),
         };
-        let (mut srv, _answer_rx, _out_rx) = test_server();
+        let (mut srv, _answer_rx, _out_rx, ..) = test_server();
         let running = srv.session.as_ref().unwrap().handle.session_id.clone();
 
         let result = load_session(&mut srv, &load_request(target), &acp_params(storage)).await;
@@ -1498,14 +1514,14 @@ mod tests {
         }
     }
 
-    fn server_with_ask(ask: Ask) -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
-        let (server, answer_rx, out_rx) = test_server();
+    fn server_with_ask(ask: Ask) -> TestServer {
+        let (server, answer_rx, out_rx, model_rx) = test_server();
         pending(&server)
             .lock()
             .unwrap()
             .asks
             .insert(ANSWERED_ID, ask);
-        (server, answer_rx, out_rx)
+        (server, answer_rx, out_rx, model_rx)
     }
 
     const PUMP_CWD: &str = "/project";
@@ -1618,7 +1634,7 @@ mod tests {
     #[test_case(true ; "cancel_keeps_the_asks_a_moved_call_may_wait_on")]
     #[tokio::test]
     async fn concurrent_subagent_permissions(cancel: bool) {
-        let (srv, main_rx, out_rx) = test_server();
+        let (srv, main_rx, out_rx, ..) = test_server();
         let children = [flume::unbounded(), flume::unbounded()];
         run_pump(&srv, None, |sender| {
             for ((answer_tx, _), child_id) in children.iter().zip(CHILD_TOOL_USE_IDS) {
@@ -1699,7 +1715,7 @@ mod tests {
     /// agent's, and the main agent's next wait would eat it as its own.
     #[tokio::test]
     async fn a_subagent_permission_without_an_answer_channel_is_never_asked() {
-        let (srv, main_rx, out_rx) = test_server();
+        let (srv, main_rx, out_rx, ..) = test_server();
         run_pump(&srv, None, |sender| {
             sender
                 .send_envelope(Envelope {
@@ -1779,7 +1795,7 @@ mod tests {
     /// the channel for the next turn.
     #[tokio::test]
     async fn an_answer_for_a_cancelled_ask_is_not_consumed_by_the_next_turn() {
-        let (srv, answer_rx, out_rx) = test_server();
+        let (srv, answer_rx, out_rx, ..) = test_server();
         handle_notification(&srv, "session/cancel");
         run_pump(&srv, None, |sender| {
             sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
@@ -1845,7 +1861,7 @@ mod tests {
     /// client's outstanding `session/prompt` is answered instead of hanging.
     #[tokio::test]
     async fn event_pump_delivers_everything_queued_before_the_close() {
-        let (srv, .., out_rx) = test_server();
+        let (srv, _, out_rx, _) = test_server();
         pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
         run_pump(&srv, None, |sender| {
             sender
@@ -1874,7 +1890,7 @@ mod tests {
     /// child, like the rest of its stream.
     #[tokio::test]
     async fn an_accepted_notice_reaches_the_client_in_stream_order() {
-        let (srv, .., out_rx) = test_server();
+        let (srv, _, out_rx, _) = test_server();
         pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
         run_pump(&srv, None, |sender| {
             sender
@@ -1938,7 +1954,7 @@ mod tests {
     #[test_case(false, AcpError::internal_error() ; "other_error_is_internal")]
     #[tokio::test]
     async fn a_failed_turn_answers_the_prompt_with_its_error_kind(auth: bool, expected: AcpError) {
-        let (srv, .., out_rx) = test_server();
+        let (srv, _, out_rx, _) = test_server();
         pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
         run_pump(&srv, None, |sender| {
             sender
@@ -1968,7 +1984,7 @@ mod tests {
         terminal: Option<AgentEvent>,
         keeps_input: bool,
     ) {
-        let (srv, .., out_rx) = test_server();
+        let (srv, _, out_rx, _) = test_server();
         run_pump(&srv, None, |sender| {
             sender.send(write_tool_start(PARENT_TOOL_USE_ID)).unwrap();
             if let Some(event) = terminal {
@@ -1993,7 +2009,7 @@ mod tests {
     /// would name a file the subagent is not touching.
     #[tokio::test]
     async fn a_subagent_permission_ignores_a_colliding_cached_input() {
-        let (srv, .., out_rx) = test_server();
+        let (srv, _, out_rx, _) = test_server();
         let (answer_tx, _answer_rx) = flume::unbounded();
         run_pump(&srv, None, |sender| {
             sender
@@ -2026,7 +2042,7 @@ mod tests {
     #[test_case(None, MAIN_PERMISSION_TITLE ; "no_reason_keeps_the_plain_title")]
     #[tokio::test]
     async fn permission_title_carries_the_escalation_reason(reason: Option<&str>, title: &str) {
-        let (srv, .., out_rx) = test_server();
+        let (srv, _, out_rx, _) = test_server();
         run_pump(&srv, None, |sender| {
             sender
                 .send(AgentEvent::PermissionRequest {
@@ -2050,7 +2066,7 @@ mod tests {
     /// even though their events never enter the transcript.
     #[tokio::test]
     async fn event_pump_folds_restored_and_subagent_cost_into_the_usage_update() {
-        let (srv, .., out_rx) = test_server();
+        let (srv, _, out_rx, _) = test_server();
         run_pump(&srv, Some(RECORDED_COST), |sender| {
             sender
                 .send_envelope(Envelope {
@@ -2085,7 +2101,7 @@ mod tests {
     #[test_case(true ; "a_failed_run")]
     #[tokio::test]
     async fn event_pump_settles_a_run_on_its_ledger(failed: bool) {
-        let (srv, .., out_rx) = test_server();
+        let (srv, _, out_rx, _) = test_server();
         let ledger = RunTotals {
             cost: Some(LEDGER_COST),
             ..RunTotals::default()
@@ -2234,7 +2250,7 @@ mod tests {
 
     #[tokio::test]
     async fn discovered_models_are_pushed_to_the_client() {
-        let (mut srv, .., out_rx) = test_server();
+        let (mut srv, _, out_rx, _) = test_server();
         srv.model_specs = vec![OFFLINE_SPEC.to_owned()];
         let batch = vec![DISCOVERED_SPEC.to_owned()];
 
@@ -2255,6 +2271,20 @@ mod tests {
 
         refresh_models(&mut srv, batch);
         assert!(out_rx.is_empty(), "a batch adding nothing is not announced");
+    }
+
+    /// A provider that only learns its windows over the wire resolves to its
+    /// fallback until discovery lands, so the running session is re-resolved
+    /// even by a batch that adds no selectable spec.
+    #[tokio::test]
+    async fn discovery_re_resolves_the_running_model() {
+        let (mut srv, .., model_rx) = test_server();
+        srv.session.as_mut().unwrap().current_model = SELECTED_SPEC.to_owned();
+
+        refresh_models(&mut srv, Vec::new());
+
+        let model = model_rx.try_recv().expect("the session model is re-resolved");
+        assert_eq!(model.spec(), SELECTED_SPEC);
     }
 
     /// Editor clients call `session/list` to offer resuming a session. The
@@ -2321,7 +2351,7 @@ mod tests {
             )
             .unwrap();
 
-        let (mut srv, _answer_rx, out_rx) = test_server();
+        let (mut srv, _answer_rx, out_rx, ..) = test_server();
         srv.session = None;
         let params = acp_params(storage);
         let raw = serde_json::json!({ "params": {} });
