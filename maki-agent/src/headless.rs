@@ -383,11 +383,14 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             let event_tx = base_tx.with_run_id(run_id);
             let error_tx = event_tx.clone();
 
+            // Discovery can raise the window of the spec already running, so a
+            // same-spec pick is still a change worth reconnecting for.
             if let Some(mut new_model) = model_rx
                 .try_iter()
                 .last()
                 .filter(|candidate| params.model_policy.allows(&candidate.spec()))
-                && new_model.spec() != model.spec()
+                && (new_model.spec() != model.spec()
+                    || new_model.context_window != model.context_window)
             {
                 let Some(switched) = connect(&mut new_model, params.timeouts, &error_tx).await
                 else {
