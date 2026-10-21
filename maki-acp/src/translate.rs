@@ -7,6 +7,7 @@ use agent_client_protocol_schema::v1::{
     ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use maki_agent::DoneReason;
+use maki_agent::mcp::wire_tool_name;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::types::{ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
 use maki_providers::{ContentBlock as MsgBlock, ImageMediaType, Message, Role as MsgRole};
@@ -88,15 +89,30 @@ pub fn tool_pending(id: &str, name: &str) -> SessionUpdate {
     let kind = tool_kind(name);
     SessionUpdate::ToolCall(
         ToolCall::new(ToolCallId::from(id.to_string()), name.to_string())
+            .name(name.to_string())
             .kind(kind)
             .status(ToolCallStatus::Pending),
     )
 }
 
+/// Clients render the title as the whole row, so a summary that names nothing
+/// ("3 lines", "2 tools") would leave the row unnamed. One that already names
+/// its tool (`mcp: server.tool`) is kept verbatim.
+fn tool_title(name: &str, summary: &str) -> String {
+    if summary.is_empty() {
+        name.to_string()
+    } else if summary.contains(name) {
+        summary.to_string()
+    } else {
+        format!("{name}: {summary}")
+    }
+}
+
 pub fn tool_start(event: &ToolStartEvent, cwd: &Path, home: Option<&Path>) -> SessionUpdate {
     let mut fields = ToolCallUpdateFields::new()
         .status(ToolCallStatus::InProgress)
-        .title(event.summary.clone());
+        .title(tool_title(&event.tool, &event.summary))
+        .name(wire_tool_name(&event.tool));
 
     if let Some(raw) = &event.raw_input {
         fields = fields.raw_input(raw.clone());
@@ -113,6 +129,33 @@ pub fn tool_start(event: &ToolStartEvent, cwd: &Path, home: Option<&Path>) -> Se
     ))
 }
 
+/// A nested call (`batch`, `code_execution`, lua) reports no start of its own,
+/// so a prompt it asks has no call to point at and clients fall back to the
+/// parent that wrapped it. This creates the call the prompt is about, named the
+/// way the model called it.
+pub fn nested_tool_call(
+    id: &str,
+    tool: &str,
+    raw_input: Option<serde_json::Value>,
+) -> SessionUpdate {
+    let name = wire_tool_name(tool);
+    let mut call = ToolCall::new(ToolCallId::from(id.to_string()), name.clone())
+        .name(name)
+        .kind(tool_kind(tool))
+        .status(ToolCallStatus::Pending);
+    if let Some(raw) = raw_input {
+        call = call.raw_input(raw);
+    }
+    SessionUpdate::ToolCall(call)
+}
+
+pub fn tool_status(id: &str, status: ToolCallStatus) -> SessionUpdate {
+    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+        ToolCallId::from(id.to_string()),
+        ToolCallUpdateFields::new().status(status),
+    ))
+}
+
 /// Zed merges a permission request into the `tool_call_update` we sent a
 /// moment earlier, so it already shows the file. JetBrains renders the request
 /// on its own, which is why we repeat the context here. Without a raw input
@@ -123,10 +166,17 @@ pub fn permission_update(
     title: String,
     tool: &str,
     raw_input: Option<&serde_json::Value>,
+    reports_name: bool,
     cwd: &Path,
     home: Option<&Path>,
 ) -> ToolCallUpdate {
     let mut fields = ToolCallUpdateFields::new().title(title);
+
+    // A subagent's permission rides on the `task` call, so naming it after the
+    // child's tool would rename a row the client already shows.
+    if reports_name {
+        fields = fields.name(wire_tool_name(tool));
+    }
 
     if let Some(raw_input) = raw_input {
         fields = fields.kind(tool_kind(tool)).raw_input(raw_input.clone());
@@ -441,6 +491,7 @@ fn replay_tool_call(
     home: Option<&Path>,
 ) -> SessionUpdate {
     let call = ToolCall::new(ToolCallId::from(id.to_string()), name.to_string())
+        .name(name.to_string())
         .kind(tool_kind(name))
         .status(ToolCallStatus::Pending)
         .raw_input(input.clone())
@@ -644,6 +695,42 @@ mod tests {
     #[test_case("nonexistent_plugin_tool", ToolKind::Other ; "unknown_tool_is_other")]
     fn tool_kind_from_registry(name: &str, expected: ToolKind) {
         assert_eq!(tool_kind(name), expected);
+    }
+
+    /// A client renders the title as the whole row, so tools whose summary is
+    /// just a count must still say which tool ran.
+    #[test_case("code_execution", "3 lines", "code_execution: 3 lines" ; "line_count_keeps_the_name")]
+    #[test_case("batch", "2 tools", "batch: 2 tools" ; "tool_count_keeps_the_name")]
+    #[test_case("read", "src/main.rs:1-20", "read: src/main.rs:1-20" ; "path_keeps_the_name")]
+    #[test_case("read", "", "read" ; "empty_summary_is_the_name")]
+    #[test_case("question", "question", "question" ; "summary_equal_to_the_name_is_kept")]
+    #[test_case("srv.tool", "mcp: srv.tool", "mcp: srv.tool" ; "mcp_summary_already_names_it")]
+    fn tool_title_always_names_the_tool(name: &str, summary: &str, expected: &str) {
+        assert_eq!(tool_title(name, summary), expected);
+    }
+
+    /// Clients that show the programmatic name next to the title need it on the
+    /// call that creates the entry; later updates only carry it in wire form.
+    #[test_case("bash", "bash" ; "native_tool_keeps_its_name")]
+    #[test_case("srv.tool", "srv__tool" ; "mcp_name_is_reported_in_wire_form")]
+    fn tool_calls_report_their_programmatic_name(tool: &str, expected: &str) {
+        let pending = serde_json::to_value(tool_pending("t-1", expected)).unwrap();
+        assert_eq!(pending["name"], expected);
+
+        let start = serde_json::to_value(tool_start(
+            &start_event(tool, None),
+            Path::new(CWD),
+            Some(Path::new(HOME)),
+        ))
+        .unwrap();
+        assert_eq!(start["name"], expected, "{start}");
+
+        let json = updates_json(&[assistant(vec![MsgBlock::tool_use(
+            "t-1",
+            expected,
+            json!({}),
+        )])]);
+        assert_eq!(json[0]["name"], expected, "{}", json[0]);
     }
 
     fn start_event(tool: &str, raw_input: Option<serde_json::Value>) -> ToolStartEvent {
@@ -876,6 +963,7 @@ mod tests {
             PERMISSION_TITLE.to_string(),
             tool,
             raw_input,
+            true,
             cwd,
             Some(Path::new(HOME)),
         );
@@ -956,6 +1044,16 @@ mod tests {
         let json = write_permission_json(dir.path());
         assert!(json["content"].is_null(), "{json}");
         assert_eq!(json["rawInput"]["content"], NEW_TEXT);
+    }
+
+    /// The prompt has to name the tool even when the client renders it from the
+    /// request alone, without the `tool_call` we sent earlier.
+    #[test]
+    fn permission_reports_the_tool_name() {
+        let native = permission_json("write", None, Path::new(CWD));
+        assert_eq!(native["name"], "write");
+        let mcp = permission_json("srv.tool", None, Path::new(CWD));
+        assert_eq!(mcp["name"], "srv__tool", "{mcp}");
     }
 
     /// A FIFO reads as empty metadata and then blocks until someone writes to

@@ -13,7 +13,7 @@ use agent_client_protocol_schema::v1::{
     RequestPermissionResponse, Response, SessionConfigOptionValue, SessionId, SessionModeId,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent,
+    TextContent, ToolCallStatus,
 };
 use color_eyre::eyre::Context;
 use flume::{Sender, WeakSender};
@@ -53,6 +53,15 @@ const RESTORED_FAST: bool = false;
 /// is not an internal error (`-32603`), nothing broke here, and the message
 /// already says which session and why.
 const SESSION_BUSY_CODE: i32 = -32000;
+/// A nested call's own id only has to be unique in the session, and the parent
+/// keeps it debuggable.
+const NESTED_CALL_ID_SEPARATOR: &str = "#";
+/// Air services a request on a different path from notifications, so a
+/// `tool_call` and the permission about it sent back to back can reach the
+/// client out of order and leave the prompt without the call it is about. Long
+/// enough for the client to take the call in first; only nested prompts, which
+/// wait on a human anyway, pay it.
+const NESTED_CALL_SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Ids come from here and are never reused, so a late answer for a closed
 /// session cannot match a request of the session that replaced it.
@@ -909,6 +918,12 @@ fn start_event_pump(
         // the tool call that asked for permission. Kept for the turn, like
         // sdk_mode does: the history holds these inputs anyway.
         let mut tool_inputs: HashMap<String, Value> = HashMap::new();
+        // A nested call (`batch`, `code_execution`, lua) reports no start, so
+        // the prompt it asks gets a call of its own here. The parent is kept so
+        // that row closes when the parent that wrapped it finishes.
+        let mut nested_calls: Vec<(String, Option<String>)> = Vec::new();
+        let mut next_nested_id: u64 = 0;
+        let mut in_flight: Vec<String> = Vec::new();
 
         while let Some(Envelope {
             event, subagent, ..
@@ -935,17 +950,25 @@ fn start_event_pump(
                         Some(reason) => format!("{reason} ({scope})"),
                         None => scope,
                     };
-                    // The cache is keyed by the call that asked for permission,
-                    // so look it up before the remap below. A subagent is left
-                    // out on purpose: nothing makes a child's ids unique
-                    // against the parent's, and naming the wrong file in a
-                    // security prompt is worse than naming none.
+                    // The cache is keyed by the call that asked for permission.
+                    // A subagent is left out on purpose: nothing makes a
+                    // child's ids unique against the parent's, and naming the
+                    // wrong file in a security prompt is worse than naming none.
                     let raw_input = subagent.is_none().then(|| tool_inputs.get(&id)).flatten();
+                    // A nested call's scope is the input itself (`gate_on_input`),
+                    // so its prompt can still show what it will run.
+                    let scope_input = subagent
+                        .is_none()
+                        .then(|| scopes.first().and_then(|s| serde_json::from_str::<Value>(s).ok()))
+                        .flatten()
+                        .filter(Value::is_object);
+                    let raw_input = raw_input.or(scope_input.as_ref());
                     // A child's own tool call never reached the client, nor
                     // this cache, so its permission rides on the `task` call
                     // the client can see, only the child's channel may take the
                     // answer, and the title is all the dialog gets.
                     let request_id = id.clone();
+                    let reports_name = subagent.is_none();
                     let (id, title, answer_tx) = match subagent {
                         Some(info) => {
                             let Some(answer_tx) = info.answer_tx else {
@@ -961,6 +984,19 @@ fn start_event_pump(
                             let title = format!("{}: {scope}", info.name);
                             (info.parent_tool_use_id, title, Some(answer_tx))
                         }
+                        None if id.is_empty() => {
+                            let parent = in_flight.last().map(String::as_str);
+                            let call_id = nested_call_id(parent, next_nested_id);
+                            next_nested_id += 1;
+                            nested_calls.push((call_id.clone(), parent.map(str::to_owned)));
+                            session_update(
+                                &out_tx,
+                                &sid,
+                                translate::nested_tool_call(&call_id, &tool, raw_input.cloned()),
+                            );
+                            smol::Timer::after(NESTED_CALL_SETTLE).await;
+                            (call_id, scope, None)
+                        }
                         None => (id, scope, None),
                     };
                     let request =
@@ -971,6 +1007,7 @@ fn start_event_pump(
                                 title,
                                 &tool,
                                 raw_input,
+                                reports_name,
                                 &cwd,
                                 home.as_deref(),
                             ),
@@ -992,6 +1029,7 @@ fn start_event_pump(
                 AgentEvent::ThinkingDelta { text } => translate::thinking_delta(&text),
                 AgentEvent::ToolPending { id, name } => translate::tool_pending(&id, &name),
                 AgentEvent::ToolStart(event) => {
+                    in_flight.push(event.id.clone());
                     let update = translate::tool_start(&event, &cwd, home.as_deref());
                     if let Some(raw_input) = event.raw_input {
                         tool_inputs.insert(event.id, raw_input);
@@ -999,10 +1037,29 @@ fn start_event_pump(
                     update
                 }
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
-                AgentEvent::ToolDone(event) => translate::tool_done(&event, &cwd, home.as_deref()),
+                AgentEvent::ToolDone(event) => {
+                    in_flight.retain(|open| open != &event.id);
+                    close_nested_calls(
+                        &mut nested_calls,
+                        Some(event.id.as_str()),
+                        ToolCallStatus::Completed,
+                        &out_tx,
+                        &sid,
+                    );
+                    translate::tool_done(&event, &cwd, home.as_deref())
+                }
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
                 AgentEvent::Done { reason, .. } => {
+                    // Every nested call belongs to a parent that already ended.
+                    close_nested_calls(
+                        &mut nested_calls,
+                        None,
+                        ToolCallStatus::Completed,
+                        &out_tx,
+                        &sid,
+                    );
                     tool_inputs.clear();
+                    in_flight.clear();
                     if let Some(id) = finish_turn(&pending) {
                         let resp = PromptResponse::new(translate::map_done_reason(reason));
                         send(
@@ -1016,7 +1073,15 @@ fn start_event_pump(
                     // A turn that dies on a provider 500 never reaches `Done`,
                     // and the pump outlives the session, so without this the
                     // whole file a `write` was carrying stays pinned forever.
+                    close_nested_calls(
+                        &mut nested_calls,
+                        None,
+                        ToolCallStatus::Failed,
+                        &out_tx,
+                        &sid,
+                    );
                     tool_inputs.clear();
+                    in_flight.clear();
                     if let Some(id) = finish_turn(&pending) {
                         let error = if auth {
                             AcpError::auth_required()
@@ -1043,6 +1108,30 @@ fn finish_turn(pending: &PendingState) -> Option<RequestId> {
     let mut pending = pending.lock().unwrap();
     pending.asks.clear();
     pending.prompt.take()
+}
+
+/// `None` closes every nested call, which is what a finished turn means.
+fn close_nested_calls(
+    nested_calls: &mut Vec<(String, Option<String>)>,
+    parent: Option<&str>,
+    status: ToolCallStatus,
+    out_tx: &Sender<Value>,
+    sid: &SessionId,
+) {
+    let (closed, open): (Vec<_>, Vec<_>) = nested_calls
+        .drain(..)
+        .partition(|(_, owner)| parent.is_none() || owner.as_deref() == parent);
+    *nested_calls = open;
+    for (child, _) in closed {
+        session_update(out_tx, sid, translate::tool_status(&child, status));
+    }
+}
+
+fn nested_call_id(parent: Option<&str>, seq: u64) -> String {
+    match parent {
+        Some(parent) => format!("{parent}{NESTED_CALL_ID_SEPARATOR}{seq}"),
+        None => format!("nested{NESTED_CALL_ID_SEPARATOR}{seq}"),
+    }
 }
 
 fn send(out_tx: &Sender<Value>, msg: impl Serialize) {
@@ -1082,6 +1171,7 @@ mod tests {
 
     use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
     use maki_agent::tools::PermissionScopes;
+    use maki_agent::types::{ToolDoneEvent, ToolOutput};
     use maki_agent::{
         CancelToken, DoneReason, EventSender, SubagentInfo, ToolStartEvent, TurnCompleteEvent,
     };
@@ -1530,13 +1620,29 @@ mod tests {
         }))
     }
 
-    fn permission_request(tool_use_id: &str) -> AgentEvent {
+    fn permission_request_with_scope(tool_use_id: &str, scope: &str) -> AgentEvent {
         AgentEvent::PermissionRequest {
             id: tool_use_id.to_owned(),
             tool: ToolKey::native(PERMISSION_TOOL),
-            scopes: vec![PUMP_CWD.to_owned()],
+            scopes: vec![scope.to_owned()],
             reason: None,
         }
+    }
+
+    fn permission_request(tool_use_id: &str) -> AgentEvent {
+        permission_request_with_scope(tool_use_id, PUMP_CWD)
+    }
+
+    fn tool_done(tool_use_id: &str) -> AgentEvent {
+        AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            call: None,
+            id: tool_use_id.to_owned(),
+            tool: Arc::from(PERMISSION_TOOL),
+            output: Arc::new(ToolOutput::Plain(String::new().into())),
+            is_error: false,
+            annotation: None,
+            written_path: None,
+        }))
     }
 
     #[test_case(false ; "answers_reach_the_agent_that_asked_even_out_of_order")]
@@ -1832,6 +1938,72 @@ mod tests {
         assert_eq!(request["method"], "session/request_permission");
         assert_eq!(call["title"], MAIN_PERMISSION_TITLE);
         assert_eq!(!call["rawInput"].is_null(), keeps_input, "{request}");
+    }
+
+    /// A nested call reports no start of its own, so its prompt has to point at
+    /// a call created with the child's name; clients render the parent otherwise.
+    #[test]
+    fn a_nested_permission_creates_the_call_it_points_at() {
+        let (srv, _, out_rx, _) = test_server();
+        let input = serde_json::json!({"path": PUMP_CWD, "content": QUEUED_TEXT});
+        let scope = input.to_string();
+        run_pump(&srv, None, |sender| {
+            sender.send(write_tool_start(PARENT_TOOL_USE_ID)).unwrap();
+            sender
+                .send(permission_request_with_scope("", &scope))
+                .unwrap();
+        });
+
+        let messages: Vec<Value> = out_rx.try_iter().collect();
+        let created = messages
+            .iter()
+            .map(|m| &m["params"]["update"])
+            .find(|update| update["sessionUpdate"] == "tool_call")
+            .expect("the nested call is created");
+        assert_eq!(created["name"], PERMISSION_TOOL);
+        assert_eq!(created["title"], PERMISSION_TOOL);
+        assert_eq!(created["rawInput"], input);
+
+        let request = messages
+            .last()
+            .expect("the permission request reaches the client");
+        let call = &request["params"]["toolCall"];
+        assert_eq!(request["method"], "session/request_permission");
+        assert_eq!(call["toolCallId"], created["toolCallId"]);
+        assert_eq!(call["rawInput"], input);
+        assert_eq!(call["title"], format!("{PERMISSION_TOOL}: {scope}"));
+    }
+
+    /// The row a nested prompt created must not spin forever: the parent that
+    /// wrapped the call owns its lifetime.
+    #[test]
+    fn a_nested_calls_row_closes_with_its_parent() {
+        let (srv, _, out_rx, _) = test_server();
+        run_pump(&srv, None, |sender| {
+            sender.send(write_tool_start(PARENT_TOOL_USE_ID)).unwrap();
+            sender.send(permission_request("")).unwrap();
+            sender.send(tool_done(PARENT_TOOL_USE_ID)).unwrap();
+        });
+
+        let updates: Vec<Value> = out_rx
+            .try_iter()
+            .map(|m| m["params"]["update"].clone())
+            .collect();
+        let child = updates
+            .iter()
+            .find(|update| update["sessionUpdate"] == "tool_call")
+            .and_then(|update| update["toolCallId"].as_str().map(str::to_owned))
+            .expect("the nested call is created");
+        assert!(
+            child.starts_with(PARENT_TOOL_USE_ID),
+            "the child rides on its parent's id: {child}"
+        );
+        assert!(
+            updates
+                .iter()
+                .any(|u| u["toolCallId"] == child && u["status"] == "completed"),
+            "the child's row closes: {updates:?}"
+        );
     }
 
     /// Ids are only unique inside one run, so a child can ask about a call whose
