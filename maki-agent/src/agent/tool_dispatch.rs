@@ -25,7 +25,7 @@ use crate::tools::hook::{
 use crate::tools::registry::{BoxFuture, InstalledHook, RegisteredTool, Tool, ToolInvocation};
 use crate::tools::{
     CallOrigin, FileKey, LocalTool, LocalToolFn, MovedCall, MovedLand, PermissionScopes,
-    ToolAudience, ToolContext, ToolExecResult, ToolLive, truncate_bytes,
+    ToolAudience, ToolContext, ToolExecResult, ToolLive,
 };
 use crate::{
     AgentError, AgentEvent, AgentSeed, CallRecord, TextOutput, ToolDoneEvent, ToolOutput,
@@ -42,7 +42,6 @@ const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
 /// retrying them.
 const MCP_SERVER_GONE: &str =
     "Its MCP server is not connected or no longer offers it, so it cannot be called now.";
-const MCP_PERM_SCOPE_MAX_BYTES: usize = 200;
 const MCP_SUMMARY_PREFIX: &str = "mcp: ";
 const SEARCH_QUERY_FIELD: &str = "query";
 
@@ -1222,9 +1221,11 @@ async fn enforce_permission(
     }
     match (inv.permission_scopes().await, ask) {
         (Some(scopes), ask) => {
-            gate(ctx, &ToolKey::native(name), &scopes, id, input, ask, hook).await
+            gate(ctx, &ToolKey::native(name), &scopes, id, input, ask, hook, false).await
         }
-        (None, Some(_)) => gate_on_input(ctx, &ToolKey::native(name), id, input, ask, hook).await,
+        (None, Some(_)) => {
+            gate_on_input(ctx, &ToolKey::native(name), id, input, ask, hook).await
+        }
         (None, None) => Ok(()),
     }
 }
@@ -1232,6 +1233,7 @@ async fn enforce_permission(
 /// Every permission check passes through here, so this is where the clock
 /// stops while the user decides. Someone who answers a minute later should
 /// not find the call already timed out before it even started.
+#[allow(clippy::too_many_arguments)]
 async fn gate(
     ctx: &ToolContext,
     tool: &ToolKey,
@@ -1240,6 +1242,7 @@ async fn gate(
     input: &Value,
     ask: Option<&str>,
     hook: Option<&Hook<'_>>,
+    scopes_from_input: bool,
 ) -> Result<(), String> {
     let layers = hook.map(|hook| PromptAsk {
         hook,
@@ -1253,7 +1256,7 @@ async fn gate(
     let moved = ctx.call.is_some() && unmoved.is_none();
     let user_response_rx = ctx.user_response_rx.as_deref().filter(|_| !moved);
     let (withdraw, ask_cancel) = ctx.cancel.child();
-    let decision = ctx.permissions.enforce(
+    let decision = ctx.permissions.enforce_inner(
         tool,
         scopes,
         ctx.session_id.as_ref(),
@@ -1264,6 +1267,7 @@ async fn gate(
         ctx.mode.plan_path(),
         ask,
         layers.as_ref().map(|layers| layers as &dyn PromptLayers),
+        scopes_from_input,
     );
     let withdrawn = async move {
         if let Some(call) = unmoved {
@@ -1314,7 +1318,7 @@ async fn gate_on_input(
     ask: Option<&str>,
     hook: Option<&Hook<'_>>,
 ) -> Result<(), String> {
-    let scope = truncate_bytes(&input.to_string(), MCP_PERM_SCOPE_MAX_BYTES);
+    let scope = input.to_string();
     gate(
         ctx,
         tool,
@@ -1323,6 +1327,7 @@ async fn gate_on_input(
         input,
         ask,
         hook,
+        true,
     )
     .await
 }
