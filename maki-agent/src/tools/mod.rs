@@ -476,10 +476,12 @@ pub fn mtime(path: &Path) -> SystemTime {
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
+pub(crate) const TRUNCATION_MARKER: &str = "...";
+
 pub(crate) fn truncate_bytes(line: &str, max_bytes: usize) -> String {
     if line.len() > max_bytes {
         let boundary = line.floor_char_boundary(max_bytes);
-        format!("{}...", &line[..boundary])
+        format!("{}{TRUNCATION_MARKER}", &line[..boundary])
     } else {
         line.to_owned()
     }

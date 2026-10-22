@@ -41,6 +41,12 @@ pub const MIN_MAX_INPUT_LINES: u32 = 1;
 
 pub const MAX_SERVER_NAME_LEN: usize = 64;
 
+/// The LLM wire format has one limit for `server__tool`.
+const MAX_WIRE_NAME_LEN: usize = 64;
+
+/// The wire format joins the server and the tool with `__`.
+const WIRE_NAME_SEPARATOR_LEN: usize = 2;
+
 pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
 /// What one turn asks to generate. A number of maki's own choosing rather than
@@ -1080,7 +1086,7 @@ impl serde::Serialize for ToolKey {
 /// Tool names with dots, over 64 chars, or special characters are rejected.
 pub fn is_valid_wire_name(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 64
+        && name.len() <= MAX_WIRE_NAME_LEN
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
@@ -1119,8 +1125,8 @@ impl ToolKey {
                     return Err(ToolKeyParseError::InvalidToolName(tool.to_string()));
                 }
                 // Wire format is server__tool — check total length fits LLM API limits
-                let wire_len = server.len() + 2 + tool.len();
-                if wire_len > 64 {
+                let wire_len = server.len() + WIRE_NAME_SEPARATOR_LEN + tool.len();
+                if wire_len > MAX_WIRE_NAME_LEN {
                     return Err(ToolKeyParseError::WireNameTooLong {
                         server: server.to_string(),
                         tool: tool.to_string(),
@@ -2156,14 +2162,15 @@ fn push_mcp_tool_rule(
     rules: &mut Vec<PermissionRule>,
     server_name: &str,
     tool_name: &str,
+    scope: Option<&str>,
     effect: Effect,
 ) {
     let qualified = format!("{server_name}.{tool_name}");
     match ToolKey::parse(&qualified) {
-        Ok(key) => {
+        Ok(tool) => {
             rules.push(PermissionRule {
-                tool: key,
-                scope: None,
+                tool,
+                scope: scope.map(str::to_owned),
                 effect,
             });
         }
@@ -2174,6 +2181,92 @@ fn push_mcp_tool_rule(
                 error = %e,
                 "skipping invalid MCP tool name"
             );
+        }
+    }
+}
+
+fn is_json_object(pattern: &str) -> bool {
+    serde_json::from_str::<JsonValue>(pattern).is_ok_and(|v| v.is_object())
+}
+
+/// An argument pattern that is neither `"*"` nor a JSON object. An allow that
+/// cannot be understood is dropped; a deny falls back to denying the whole
+/// tool, because silently dropping a deny would widen permissions.
+fn reject_mcp_argument_pattern(
+    rules: &mut Vec<PermissionRule>,
+    server_name: &str,
+    tool_name: &str,
+    pattern: &toml::Value,
+    effect: Effect,
+) {
+    tracing::warn!(
+        server = server_name,
+        tool = tool_name,
+        pattern = ?pattern,
+        effect = ?effect,
+        "invalid MCP argument pattern — expected \"*\" or a JSON object"
+    );
+    if effect == Effect::Deny {
+        push_mcp_tool_rule(rules, server_name, tool_name, None, effect);
+    }
+}
+
+fn parse_mcp_tool_table(
+    server_name: &str,
+    tool_name: &str,
+    table: &toml::Table,
+    rules: &mut Vec<PermissionRule>,
+) {
+    if !is_valid_tool_name(tool_name)
+        || server_name.len() + WIRE_NAME_SEPARATOR_LEN + tool_name.len() > MAX_WIRE_NAME_LEN
+    {
+        tracing::warn!(
+            server = server_name,
+            tool = tool_name,
+            "skipping invalid MCP tool table"
+        );
+        return;
+    }
+
+    for (key, value) in table {
+        let effect = match key.as_str() {
+            "allow" => Effect::Allow,
+            "deny" => Effect::Deny,
+            other => {
+                tracing::warn!(
+                    server = server_name,
+                    tool = tool_name,
+                    key = other,
+                    "unknown key in [mcp.{server_name}.{tool_name}] — ignored"
+                );
+                continue;
+            }
+        };
+        let patterns = match value {
+            toml::Value::Array(patterns) => patterns,
+            other => {
+                tracing::warn!(
+                    server = server_name,
+                    tool = tool_name,
+                    key = key.as_str(),
+                    value = ?other,
+                    "expected an array of argument patterns in \
+                     [mcp.{server_name}.{tool_name}]"
+                );
+                if effect == Effect::Deny {
+                    push_mcp_tool_rule(rules, server_name, tool_name, None, effect);
+                }
+                continue;
+            }
+        };
+        for pattern in patterns {
+            match pattern.as_str() {
+                Some("*") => push_mcp_tool_rule(rules, server_name, tool_name, None, effect),
+                Some(scope) if is_json_object(scope) => {
+                    push_mcp_tool_rule(rules, server_name, tool_name, Some(scope), effect);
+                }
+                _ => reject_mcp_argument_pattern(rules, server_name, tool_name, pattern, effect),
+            }
         }
     }
 }
@@ -2247,7 +2340,7 @@ fn parse_mcp_server_table(
                                     });
                                     continue;
                                 }
-                                push_mcp_tool_rule(rules, server_name, tool_name, effect);
+                                push_mcp_tool_rule(rules, server_name, tool_name, None, effect);
                             }
                         }
                     }
@@ -2270,7 +2363,7 @@ fn parse_mcp_server_table(
                                 "{key} = \"{tool_name}\" coerced to {key} = [\"{tool_name}\"] — \
                                  consider using array syntax"
                             );
-                            push_mcp_tool_rule(rules, server_name, tool_name, effect);
+                            push_mcp_tool_rule(rules, server_name, tool_name, None, effect);
                         }
                     }
                     other => {
@@ -2301,13 +2394,8 @@ fn parse_mcp_server_table(
                 }
             }
             other => {
-                if value.is_table() {
-                    tracing::warn!(
-                        server = server_name,
-                        key = other,
-                        "unknown key [mcp.{server_name}.{other}] — server names cannot \
-                         contain dots; use [mcp.{other}] instead if this is a server name"
-                    );
+                if let toml::Value::Table(tool_table) = value {
+                    parse_mcp_tool_table(server_name, other, tool_table, rules);
                 } else {
                     tracing::warn!(
                         server = server_name,
@@ -4428,6 +4516,150 @@ mod tests {
                 tool: "search".into()
             }
         );
+    }
+
+    #[test]
+    fn permissions_mcp_tool_table_argument_scopes() {
+        const ARG_ALLOW: &str = r#"{"command":"open_file_in_editor *"}"#;
+
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            &format!("[mcp.jetbrains.execute_tool]\nallow = ['{ARG_ALLOW}', \"*\"]\n"),
+        );
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
+
+        let tool = ToolKey::McpTool {
+            server: "jetbrains".into(),
+            tool: "execute_tool".into(),
+        };
+        assert_eq!(perms.rules.len(), 2);
+        assert!(perms.rules.iter().any(|rule| {
+            rule.tool == tool
+                && rule.effect == Effect::Allow
+                && rule.scope.as_deref() == Some(ARG_ALLOW)
+        }));
+        assert!(perms.rules.iter().any(|rule| {
+            rule.tool == tool && rule.effect == Effect::Allow && rule.scope.is_none()
+        }));
+    }
+
+    #[test_case("not-json" ; "not_json")]
+    #[test_case("[1, 2]" ; "array_is_not_an_object")]
+    #[test_case("\"text\"" ; "string_is_not_an_object")]
+    fn permissions_mcp_invalid_argument_pattern_fails_closed_for_deny(pattern: &str) {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            &format!("[mcp.srv.tool]\nallow = ['{pattern}']\ndeny = ['{pattern}']\n"),
+        );
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
+
+        assert_eq!(perms.rules.len(), 1, "allow dropped, deny widened");
+        assert_eq!(perms.rules[0].effect, Effect::Deny);
+        assert!(perms.rules[0].scope.is_none());
+    }
+
+    #[test]
+    fn permissions_mcp_non_string_argument_pattern_ignored() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), "[mcp.srv.tool]\nallow = [123]\n");
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
+
+        assert!(perms.rules.is_empty());
+    }
+
+    #[test_case("bad.tool" ; "dotted_tool_name")]
+    #[test_case("*" ; "wildcard_tool_name")]
+    #[test_case("tool_name_that_is_far_too_long_to_fit_in_the_wire_limit_of_sixty_four_bytes" ; "wire_name_too_long")]
+    #[test_case("tool_tool_tool_tool_tool_tool_tool_tool_tool_tool_tool_tool_tool" ; "wire_name_too_long_with_the_server")]
+    fn permissions_mcp_invalid_tool_table_key_rejected(tool: &str) {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            &format!("[mcp.srv.\"{tool}\"]\nallow = [\"*\"]\ndeny = ['{{\"command\":\"rm *\"}}']\n"),
+        );
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
+
+        assert!(perms.rules.is_empty());
+    }
+
+    /// A non-array allow is dropped, but a non-array deny must still deny the
+    /// whole tool: skipping it would widen permissions.
+    #[test_case("true" ; "boolean")]
+    #[test_case("'{\"command\": \"rm *\"}'" ; "json_string")]
+    fn permissions_mcp_non_array_tool_setting_fails_closed(setting: &str) {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            &format!("[mcp.srv.tool]\nallow = {setting}\ndeny = {setting}\n"),
+        );
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
+
+        assert_eq!(perms.rules.len(), 1, "allow dropped, deny widened");
+        assert_eq!(perms.rules[0].effect, Effect::Deny);
+        assert!(perms.rules[0].scope.is_none());
+    }
+
+    #[test]
+    fn permissions_mcp_unknown_tool_table_key_ignored() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            "[mcp.srv.tool]\nallow = [\"*\"]\nunknown = [\"x\"]\n",
+        );
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
+
+        assert_eq!(perms.rules.len(), 1);
+        assert_eq!(perms.rules[0].effect, Effect::Allow);
+        assert!(perms.rules[0].scope.is_none());
+    }
+
+    #[test]
+    fn permissions_mcp_argument_denies_survive_untrusted_projects() {
+        const ARG_ALLOW: &str = r#"{"command":"open *"}"#;
+        const ARG_DENY: &str = r#"{"command":"execute_terminal_command *"}"#;
+
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_project_permissions(
+            dir.path(),
+            &format!(
+                "[mcp.jetbrains.execute_tool]\nallow = ['{ARG_ALLOW}']\ndeny = ['{ARG_DENY}']\n"
+            ),
+        );
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::discover(dir.path()),
+        );
+
+        assert_eq!(perms.rules.len(), 1);
+        assert_eq!(perms.rules[0].effect, Effect::Deny);
+        assert_eq!(perms.rules[0].scope.as_deref(), Some(ARG_DENY));
     }
 
     #[test]

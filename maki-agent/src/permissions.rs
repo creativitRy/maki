@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,14 +13,22 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 use crate::tools::PermissionScopes;
+use crate::tools::TRUNCATION_MARKER;
 use crate::tools::registry::BoxFuture;
+use crate::tools::truncate_bytes;
 use crate::{AgentEvent, CancelToken, EventSender};
+
+mod mcp_scope;
 
 pub const DEFAULT_DENY_GUIDANCE: &str =
     "Do not retry. Try a different approach or ask the user for guidance.";
 
 /// Tests assert on this exact prefix; a wording tweak here updates them in one place.
 pub const PERMISSION_DENIED_PREFIX: &str = "Permission denied for";
+
+/// A displayed scope stays within this many bytes, the ellipsis included.
+/// Matching always sees the full string.
+pub const SCOPE_DISPLAY_MAX_BYTES: usize = 200;
 
 /// Values for the `source` attribute on `maki.tool_decision` events.
 pub const DECISION_SOURCE_RULE: &str = "rule";
@@ -104,7 +113,7 @@ impl std::fmt::Display for PermissionError {
         write!(
             f,
             "{} `{}` ({}): {}.",
-            PERMISSION_DENIED_PREFIX, self.tool, self.scope, self.reason
+            PERMISSION_DENIED_PREFIX, self.tool, scope_display(&self.scope), self.reason
         )?;
         match (&self.plugin, &self.guidance) {
             (Some(p), Some(g)) => write!(f, " Plugin `{p}` denied it: {g}"),
@@ -131,6 +140,14 @@ impl PermissionError {
             plugin,
         }
     }
+}
+
+pub fn scope_display(scope: &str) -> Cow<'_, str> {
+    if scope.len() <= SCOPE_DISPLAY_MAX_BYTES {
+        return Cow::Borrowed(scope);
+    }
+    let keep = SCOPE_DISPLAY_MAX_BYTES - TRUNCATION_MARKER.len();
+    Cow::Owned(truncate_bytes(scope, keep))
 }
 
 /// Where a matched rule came from, named in the denial reason so the model
@@ -765,13 +782,47 @@ impl PermissionManager {
         ask: Option<&str>,
         layers: Option<&dyn PromptLayers>,
     ) -> Result<Option<Arc<str>>, PermissionError> {
+        self.enforce_inner(
+            tool,
+            scopes,
+            session,
+            event_tx,
+            user_response_rx,
+            request_id,
+            cancel,
+            plan_path,
+            ask,
+            layers,
+            false,
+        )
+        .await
+    }
+
+    /// `scopes_from_input` marks a call whose scope is the bare tool input.
+    /// That has no stable pattern, so an "always" answer has to cover the whole
+    /// tool, the same way it does for an MCP call.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn enforce_inner(
+        &self,
+        tool: &ToolKey,
+        scopes: &PermissionScopes,
+        session: Option<&SessionRef>,
+        event_tx: &EventSender,
+        user_response_rx: Option<&smol::lock::Mutex<flume::Receiver<String>>>,
+        request_id: &str,
+        cancel: &CancelToken,
+        plan_path: Option<&Path>,
+        ask: Option<&str>,
+        layers: Option<&dyn PromptLayers>,
+        scopes_from_input: bool,
+    ) -> Result<Option<Arc<str>>, PermissionError> {
         let check = |tool: &ToolKey, scopes: &[&str], force_prompt: bool| match ask {
             Some(_) => self.check_escalated(tool, scopes, plan_path),
             None => self.check_inner(tool, scopes, force_prompt, plan_path),
         };
         let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
         let tool_string = tool.to_string();
-        let scope_display = || scopes.scopes.join("; ");
+        let joined_scopes = || scopes.scopes.join("; ");
         // Every deny is built here and every approval passes through
         // `allowed`, so reporting cannot drift from what the caller gets.
         let deny = |source: &'static str,
@@ -779,7 +830,7 @@ impl PermissionManager {
                     guidance: Option<String>,
                     plugin: Option<Arc<str>>| {
             maki_otel::emit::tool_decision(&tool_string, maki_otel::emit::DECISION_REJECT, source);
-            PermissionError::denied(&tool_string, &scope_display(), reason, guidance, plugin)
+            PermissionError::denied(&tool_string, &joined_scopes(), reason, guidance, plugin)
         };
         let allowed = |source: &'static str| {
             maki_otel::emit::tool_decision(&tool_string, maki_otel::emit::DECISION_ACCEPT, source);
@@ -830,7 +881,7 @@ impl PermissionManager {
         let Some(rx) = user_response_rx else {
             warn!(
                 tool = %tool,
-                scope = %scope_display(),
+                scope = %joined_scopes(),
                 session = ?session,
                 request_id,
                 "denied a permission prompt nobody can answer"
@@ -870,7 +921,7 @@ impl PermissionManager {
                     Some(tagged) if tagged.request_id == request_id => break tagged.answer,
                     tagged => warn!(
                         tool = %tool,
-                        scope = %scope_display(),
+                        scope = %joined_scopes(),
                         request_id,
                         answered = tagged.map(|t| t.request_id).unwrap_or_default(),
                         "discarding a permission answer that does not name this request"
@@ -878,7 +929,7 @@ impl PermissionManager {
                 },
                 Ok(Err(_)) => {
                     drop(guard);
-                    warn!(tool = %tool, scope = %scope_display(), "permission channel closed");
+                    warn!(tool = %tool, scope = %joined_scopes(), "permission channel closed");
                     return Err(deny(
                         DECISION_SOURCE_USER_ABORT,
                         PROMPT_UNANSWERED_REASON.to_owned(),
@@ -899,7 +950,12 @@ impl PermissionManager {
         };
         drop(guard);
 
-        self.apply_decision(&t2, &s2, &answer);
+        let decision_scopes = if scopes_from_input {
+            vec!["*".to_owned()]
+        } else {
+            s2
+        };
+        self.apply_decision(&t2, &decision_scopes, &answer);
         let source = answer.decision_source();
         if answer.is_allow() {
             allowed(source)
@@ -943,13 +999,18 @@ fn rule_reach(rule_key: &ToolKey, actual: &ToolKey) -> Option<Approval> {
 
 /// A deny fails closed: a pattern refused as a blanket allow also denies
 /// every scope, even where [`scope_matches`] reads it as a narrower subtree.
+/// MCP argument patterns match as JSON subsets instead, where only the
+/// literal `*` is tool-wide.
 fn rule_matches_scope(rule: &PermissionRule, scope: &str) -> bool {
     match &rule.scope {
         None => true,
-        Some(pattern) => {
-            (rule.effect == Effect::Deny && is_universal_scope(pattern))
-                || scope_matches(pattern, scope)
-        }
+        Some(pattern) => match rule.tool {
+            ToolKey::McpTool { .. } => pattern == "*" || mcp_scope::matches(pattern, scope),
+            _ => {
+                (rule.effect == Effect::Deny && is_universal_scope(pattern))
+                    || scope_matches(pattern, scope)
+            }
+        },
     }
 }
 
@@ -1112,6 +1173,10 @@ mod tests {
     const MCP_SERVER: &str = "deepwiki";
     const MCP_TOOL: &str = "deepwiki.search";
     const MCP_ARGS: &str = "{\"q\":\"maki\"}";
+    const MCP_ARG_PATTERN: &str = r#"{"command":"open_file_in_editor *"}"#;
+    const MCP_ARG_MATCHING: &str = r#"{"command":"open_file_in_editor --filePath x"}"#;
+    const MCP_ARG_OTHER: &str = r#"{"command":"execute_terminal_command rm -rf x"}"#;
+    const MCP_ARG_DENY: &str = r#"{"command":"execute_terminal_command *"}"#;
     const READ_TOOL: &str = "read";
     const READ_SCOPE: &str = "/home/user/project/src/main.rs";
     const TAGGED_REQUEST_ID: &str = "toolu_1";
@@ -2254,6 +2319,111 @@ mod tests {
         );
     }
 
+    #[test]
+    fn arg_scoped_mcp_allow_matches_only_matching_arguments() {
+        let mgr = mgr_with(
+            make_config(vec![PermissionRule {
+                tool: mcp_tool_key(),
+                scope: Some(MCP_ARG_PATTERN.into()),
+                effect: Effect::Allow,
+            }]),
+            PathBuf::from(TEST_CWD),
+        );
+        assert_eq!(outcome(mgr.check(&mcp_tool_key(), MCP_ARG_MATCHING, None)), ALLOWED);
+        assert_eq!(outcome(mgr.check(&mcp_tool_key(), MCP_ARG_OTHER, None)), PROMPTS);
+    }
+
+    #[test]
+    fn arg_scoped_mcp_deny_beats_a_tool_wide_allow() {
+        let mgr = mgr_with(
+            make_config(vec![
+                PermissionRule {
+                    tool: mcp_tool_key(),
+                    scope: None,
+                    effect: Effect::Allow,
+                },
+                PermissionRule {
+                    tool: mcp_tool_key(),
+                    scope: Some(MCP_ARG_DENY.into()),
+                    effect: Effect::Deny,
+                },
+            ]),
+            PathBuf::from(TEST_CWD),
+        );
+        assert_eq!(outcome(mgr.check(&mcp_tool_key(), MCP_ARG_OTHER, None)), DENIED);
+        assert_eq!(outcome(mgr.check(&mcp_tool_key(), MCP_ARG_MATCHING, None)), ALLOWED);
+    }
+
+    #[test]
+    fn plan_mode_keeps_an_arg_scoped_allow_for_an_mcp_tool() {
+        let mgr = mgr_with(
+            make_config(vec![PermissionRule {
+                tool: mcp_tool_key(),
+                scope: Some(MCP_ARG_PATTERN.into()),
+                effect: Effect::Allow,
+            }]),
+            PathBuf::from(TEST_CWD),
+        );
+        assert_eq!(
+            outcome(mgr.check(
+                &mcp_tool_key(),
+                MCP_ARG_MATCHING,
+                Some(Path::new(PLAN_FILE)),
+            )),
+            ALLOWED
+        );
+    }
+
+    #[test]
+    fn arg_scoped_mcp_allow_matches_past_the_display_limit() {
+        const NEEDLE: &str = "needle";
+        let args = format!(
+            r#"{{"command":"{}"}}"#,
+            "a".repeat(SCOPE_DISPLAY_MAX_BYTES + 50) + NEEDLE
+        );
+        let mgr = mgr_with(
+            make_config(vec![PermissionRule {
+                tool: mcp_tool_key(),
+                scope: Some(format!(r#"{{"command":"*{NEEDLE}"}}"#)),
+                effect: Effect::Allow,
+            }]),
+            PathBuf::from(TEST_CWD),
+        );
+        assert_eq!(outcome(mgr.check(&mcp_tool_key(), &args, None)), ALLOWED);
+    }
+
+    #[test]
+    fn allow_always_on_an_mcp_call_stores_a_wildcard_scope() {
+        let project = tempfile::tempdir().unwrap();
+        let mgr = PermissionManager::new(
+            PermissionsConfig::default(),
+            project.path().to_path_buf(),
+            ProjectConfig::discover(project.path()),
+            Arc::default(),
+        );
+        let tool = mcp_tool_key();
+        mgr.apply_decision(
+            &tool,
+            &[MCP_ARGS.into()],
+            &PermissionAnswer::AllowAlwaysProject,
+        );
+        let rules = mgr.session_rules_snapshot();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].tool, tool);
+        assert_eq!(rules[0].scope.as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn scope_display_truncates_only_long_scopes() {
+        assert!(matches!(scope_display("short"), Cow::Borrowed(_)));
+        let long = "x".repeat(SCOPE_DISPLAY_MAX_BYTES + 10);
+        let keep = SCOPE_DISPLAY_MAX_BYTES - TRUNCATION_MARKER.len();
+        let expected = format!("{}{TRUNCATION_MARKER}", "x".repeat(keep));
+        let shown = scope_display(&long);
+        assert_eq!(shown.as_ref(), expected.as_str());
+        assert_eq!(shown.len(), SCOPE_DISPLAY_MAX_BYTES);
+    }
+
     /// The gate itself, apart from any one source of approval. A tool plan mode
     /// cannot read is the only case where how squarely a yes was aimed changes
     /// the answer.
@@ -2558,6 +2728,39 @@ mod tests {
             .expect_err("no channel, so the prompt cannot answer")
             .to_string();
         assert!(!err.contains(LAYER_PLUGIN), "a layer answered: {err}");
+    }
+
+    /// An escalated native tool has no scopes of its own, so its scope is the
+    /// bare input. "Always" cannot save that exact input, so it has to cover
+    /// the whole tool, the way it does for MCP.
+    #[test]
+    fn an_escalated_input_scope_persists_a_tool_wide_rule() {
+        let (guard, _events) = crate::event_stream();
+        let (answer_tx, answer_rx) = flume::unbounded();
+        let answers = smol::lock::Mutex::new(answer_rx);
+        let mgr = default_mgr();
+        answer_tx
+            .send(TaggedAnswer::new(TAGGED_REQUEST_ID, PermissionAnswer::AllowSession).encode())
+            .unwrap();
+
+        let result = smol::block_on(mgr.enforce_inner(
+            &ToolKey::native("websearch"),
+            &PermissionScopes::single(r#"{"query":"maki"}"#.to_owned()),
+            None,
+            &guard.sender(0),
+            Some(&answers),
+            TAGGED_REQUEST_ID,
+            &CancelToken::none(),
+            None,
+            Some(ESCALATION),
+            None,
+            true,
+        ));
+
+        assert!(result.is_ok(), "{result:?}");
+        let rules = mgr.session_rules_snapshot();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].scope.as_deref(), Some("*"));
     }
 
     /// The guidance can echo the input the plugin judged, so the agent has to

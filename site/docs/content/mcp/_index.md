@@ -160,7 +160,14 @@ Good for small servers you rely on every turn. On a big server it defeats the po
 
 Server names are ASCII alphanumeric, hyphens ok (no dots). Tools get prefixed with their server name: a `read` tool on the `filesystem` server becomes `filesystem__read`. Because of this, `__` is reserved and names can't collide with built-in tools.
 
-Permission rules for MCP tools use the same nested form under `[mcp.<server>]` in `permissions.toml`. See [Permissions](/docs/permissions/#mcp-tool-permissions).
+Permission rules for MCP tools use the same nested form under `[mcp.<server>]` in `permissions.toml`. A tool that handles many different actions, like JetBrains' `execute_tool`, can be scoped per argument:
+
+```toml
+[mcp.jetbrains-ide.execute_tool]
+allow = ['{"command": "open_file_in_editor *"}']
+```
+
+See [Permissions](/docs/permissions/#mcp-tool-permissions).
 
 ## Runtime toggling
 

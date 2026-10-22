@@ -112,7 +112,7 @@ deny = ["admin_delete"]
 
 Each tool gets its own section with `allow` and `deny` arrays. Values are glob-like scope patterns.
 
-> **Note:** In MCP server sections (`[mcp.*]`), `allow` and `deny` take tool names only. Set a server-wide default with `default = "allow"` or `default = "deny"`. Native tool sections (e.g. `[bash]`) also accept `allow = true`.
+> **Note:** In MCP server sections (`[mcp.*]`), `allow` and `deny` take tool names, or one sub-table per tool to match on arguments (see [Argument-scoped rules](#argument-scoped-rules)). Set a server-wide default with `default = "allow"` or `default = "deny"`. Native tool sections (e.g. `[bash]`) also accept `allow = true`.
 
 ### The `default` key
 
@@ -161,6 +161,30 @@ default = "allow"               # allow all tools on this server (global only)
 
 Tool names must match `^[a-zA-Z0-9_-]{1,64}$` (no dots, max 64 chars). Server names cannot contain dots.
 
+### Argument-scoped rules
+
+Some MCP tools handle many different actions. JetBrains' `execute_tool` opens a file in the editor and runs terminal commands through the same tool, so a whole-tool allow covers both. Give the tool its own table to match on the JSON arguments instead:
+
+```toml
+[mcp.jetbrains-ide.execute_tool]
+allow = ['{"command": "open_file_in_editor *"}']
+deny = ['{"command": "execute_terminal_command *"}']
+```
+
+Each entry is a JSON object matched against the call input as a subset. Pattern keys must be present in the input, and keys left out of the pattern match any value, at any depth. A string leaf may use `*` to match any sequence of characters, so a literal `*` in an argument cannot be matched. An array pattern matches element by element from the start, so `[1, 2]` matches `[1, 2, 3]` and not `[1, 3]`. Numbers, booleans, and null compare by equality. The empty object `{}` matches every input.
+
+Matching is structural. Key order, whitespace, and the serialized text do not matter. Write patterns as TOML literal strings (`'...'`) so the JSON quotes stay readable.
+
+A plain `"*"` entry in a tool table means the whole tool, the same as listing the tool name in the server's `allow` or `deny` array. A pattern that is not valid JSON is skipped for an allow and becomes a whole-tool deny for a deny. A tool table key has to be a valid tool name, so `[mcp.<server>."*"]` is skipped. To cover every tool on a server, use `allow = ["*"]` or `deny = ["*"]` in the server table.
+
+Argument rules follow the general check flow:
+
+- A deny wins over any allow, including a whole-tool allow for the same tool.
+- Matching uses the full tool input. A prompt shortens long inputs for display only.
+- "Allow for this session" and "Allow always" save a whole-tool rule (`*`). Argument patterns come from the config files.
+- A server `default = "allow"` already allows every call, so argument allows add nothing. Use argument denies to keep selected calls out, since a deny wins over the default.
+- An untrusted project keeps its argument denies and drops its argument allows, like every other allow rule.
+
 ## Permission Prompts
 
 When a gated tool needs permission, Maki asks you.
@@ -199,7 +223,7 @@ When you pick "always allow" (or always deny for MCP), the saved scope is genera
 - **MCP tools**: always `*` (per-tool, so allowing `deepwiki.search` will not cover `deepwiki.fetch`)
 - **webfetch / websearch** (and anything else gated): the exact URL or query string is stored as-is
 
-For MCP tools, both allow and deny decisions generalize to `*` (the entire tool). MCP inputs are opaque JSON with no meaningful scope pattern. Denying a single MCP invocation denies that tool until you revoke the rule.
+For MCP tools, both allow and deny decisions from a prompt generalize to `*` (the entire tool). A prompt answer always covers the whole tool, so argument patterns are written in the config files. Denying a single MCP invocation denies that tool until you revoke the rule.
 
 ## YOLO Mode
 

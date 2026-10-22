@@ -20,7 +20,7 @@ use flume::{Sender, WeakSender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
-use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
+use maki_agent::permissions::{PermissionAnswer, TaggedAnswer, scope_display};
 use maki_agent::session::{Resumed, StoredSession};
 use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience, local_tool};
 use maki_agent::types::AgentEvent;
@@ -943,12 +943,12 @@ fn start_event_pump(
                     reason,
                 } => {
                     let tool = tool.to_string();
-                    let scope = format!("{tool}: {}", scopes.join(", "));
+                    let joined = format!("{tool}: {}", scopes.join(", "));
                     // A plugin escalated this call, and its reason is what the
                     // user most needs to read.
                     let scope = match reason {
-                        Some(reason) => format!("{reason} ({scope})"),
-                        None => scope,
+                        Some(reason) => format!("{reason} ({})", scope_display(&joined)),
+                        None => scope_display(&joined).into_owned(),
                     };
                     // The cache is keyed by the call that asked for permission.
                     // A subagent is left out on purpose: nothing makes a
@@ -1169,7 +1169,9 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 mod tests {
     use std::sync::LazyLock;
 
-    use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
+    use maki_agent::permissions::{
+        PermissionCheck, PermissionError, PermissionManager, SCOPE_DISPLAY_MAX_BYTES,
+    };
     use maki_agent::tools::PermissionScopes;
     use maki_agent::types::{ToolDoneEvent, ToolOutput};
     use maki_agent::{
@@ -1972,6 +1974,30 @@ mod tests {
         assert_eq!(call["toolCallId"], created["toolCallId"]);
         assert_eq!(call["rawInput"], input);
         assert_eq!(call["title"], format!("{PERMISSION_TOOL}: {scope}"));
+    }
+
+    /// A huge argument blob must not turn the permission dialog into a wall of
+    /// text, while the raw input still carries all of it.
+    #[test]
+    fn a_large_permission_scope_is_capped_in_the_title() {
+        let (srv, _, out_rx, _) = test_server();
+        let scope = "x".repeat(SCOPE_DISPLAY_MAX_BYTES * 2);
+        run_pump(&srv, None, |sender| {
+            sender
+                .send(permission_request_with_scope("", &scope))
+                .unwrap();
+        });
+
+        let request = out_rx
+            .try_iter()
+            .last()
+            .expect("the permission request reaches the client");
+        let call = &request["params"]["toolCall"];
+        let title = call["title"].as_str().expect("the title is a string");
+        let joined = format!("{PERMISSION_TOOL}: {scope}");
+        assert_eq!(title, scope_display(&joined).as_ref());
+        assert!(title.ends_with("..."));
+        assert!(title.len() < joined.len(), "the title is capped");
     }
 
     /// The row a nested prompt created must not spin forever: the parent that

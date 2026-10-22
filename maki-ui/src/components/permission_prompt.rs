@@ -7,7 +7,9 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, generalized_scopes};
+use maki_agent::permissions::{
+    DEFAULT_DENY_GUIDANCE, PermissionAnswer, generalized_scopes, scope_display,
+};
 use maki_config::ToolKey;
 
 use crate::components::Overlay;
@@ -368,7 +370,7 @@ impl PermissionPrompt {
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(label, label_style),
-                Span::styled(s.clone(), value_style),
+                Span::styled(scope_display(s).into_owned(), value_style),
             ]));
         }
 
@@ -378,7 +380,7 @@ impl PermissionPrompt {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(label, label_style),
-                    Span::styled(g.clone(), value_style),
+                    Span::styled(scope_display(g).into_owned(), value_style),
                 ]));
             }
         }
@@ -479,7 +481,7 @@ impl PermissionPrompt {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use maki_agent::permissions::PermissionAnswer;
+    use maki_agent::permissions::{PermissionAnswer, SCOPE_DISPLAY_MAX_BYTES, scope_display};
     use maki_config::ToolKey;
     use test_case::test_case;
 
@@ -640,6 +642,26 @@ mod tests {
         assert_eq!(second.subagent_id.as_deref(), Some(SUB_AGENT));
         assert_eq!(second.answer, PermissionAnswer::AllowOnce);
         assert!(!prompt.is_open());
+    }
+
+    /// An MCP call's scope is its whole argument object; the prompt shows the
+    /// head of it instead of a screenful.
+    #[test]
+    fn an_oversized_scope_is_truncated_on_its_line() {
+        let scope = "x".repeat(SCOPE_DISPLAY_MAX_BYTES * 2);
+        let mut prompt = PermissionPrompt::new();
+        prompt.push(
+            MAIN_ID.into(),
+            ToolKey::native("bash"),
+            vec![scope.clone()],
+            None,
+            true,
+            None,
+        );
+
+        let text = rendered(&prompt);
+        assert!(text.contains(scope_display(&scope).as_ref()));
+        assert!(!text.contains(scope.as_str()));
     }
 
     #[test]
