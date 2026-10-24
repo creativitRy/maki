@@ -409,13 +409,14 @@ pub fn resolve_search_path(path: Option<&str>) -> Result<String, String> {
     }
 }
 
-static CWD: LazyLock<Option<PathBuf>> = LazyLock::new(|| env::current_dir().ok());
 static HOME: LazyLock<Option<PathBuf>> = LazyLock::new(maki_storage::paths::home);
 
+/// The cwd is read live, not memoized: an ACP client names the project only in
+/// the session and maki adopts it after the process is already up.
 pub(crate) fn relative_path(path: &str) -> String {
     let p = Path::new(path);
-    if let Some(cwd) = CWD.as_deref()
-        && let Ok(rel) = p.strip_prefix(cwd)
+    if let Ok(cwd) = env::current_dir()
+        && let Ok(rel) = p.strip_prefix(&cwd)
     {
         return format_rel("", ".", rel);
     }

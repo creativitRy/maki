@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::env;
 use std::io::Write;
 use std::iter;
 use std::path::{Path, PathBuf};
@@ -297,6 +298,7 @@ async fn new_session(
 ) -> Result<AgentResponse, AcpError> {
     let req: NewSessionRequest = parse_params(raw)?;
     close_session(srv, SessionEndReason::Replaced).await;
+    adopt_working_dir(&req.cwd);
     let project_config = trusted_project_config(
         &req.cwd,
         &params.storage,
@@ -353,6 +355,7 @@ async fn load_session(
             loaded
         }
     };
+    adopt_working_dir(&req.cwd);
     let project_config = trusted_project_config(
         &req.cwd,
         &params.storage,
@@ -397,6 +400,26 @@ async fn load_session(
     let resp = methods::load_session_response()
         .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
     Ok(AgentResponse::LoadSessionResponse(resp))
+}
+
+/// The client launches maki in a scratch dir and names the project only in the
+/// session. Everything the model sees -- system prompt, instruction discovery,
+/// relative tool paths, Lua, child processes -- reads the process cwd, so adopt
+/// the session's as soon as the request arrives, before MCP servers spawn or
+/// the agent builds its prompt. A server holds one session at a time (a new one
+/// replaces the old), so two sessions cannot end up split across cwds. A cwd
+/// that cannot be entered leaves us where we started rather than failing a
+/// session the client thinks it opened.
+fn adopt_working_dir(cwd: &Path) {
+    if env::current_dir().is_ok_and(|current| current.as_path() == cwd) {
+        return;
+    }
+    if let Err(e) = env::set_current_dir(cwd) {
+        warn!(
+            "cannot switch to the session working directory {}: {e}",
+            cwd.display()
+        );
+    }
 }
 
 /// Spawns a session and installs it as the server's current one. Spawning
