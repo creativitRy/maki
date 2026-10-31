@@ -284,6 +284,9 @@ pub enum Command {
         /// Skip all permission prompts
         #[arg(long)]
         yolo: bool,
+        /// Start one child process per session
+        #[arg(long)]
+        multiplex: bool,
     },
     /// Show the rendered system prompt or tool definitions
     Prompt {

@@ -1,5 +1,6 @@
 pub mod elicitation;
 pub mod methods;
+pub mod multiplex;
 pub mod permissions;
 pub mod server;
 pub mod translate;
@@ -40,9 +41,10 @@ pub struct AcpParams {
     /// Folders the global `init.lua` answered for in advance. ACP never asks,
     /// so this is the only yes a cwd with no stored decision can get.
     pub trust_policy: Arc<TrustConfig>,
-    /// Called with the reason when an ACP session is replaced or the server
-    /// exits. The hook answers with a future so its wait rides the executor
-    /// instead of holding stdin for the whole `SessionEnd` grace period.
+    /// Called with the reason when an ACP session is replaced, closed by the
+    /// client, or the server exits. The hook answers with a future so its wait
+    /// rides the executor instead of holding stdin for the whole `SessionEnd`
+    /// grace period.
     pub on_session_end: Option<SessionEndHook>,
     pub storage: StateDir,
     /// `false` keeps every tool call blocking. Otherwise calls can move to the

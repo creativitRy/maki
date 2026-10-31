@@ -4,6 +4,7 @@ use std::sync::Arc;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
+use maki_acp::multiplex::ChildCommand;
 use maki_agent::tools::ToolRegistry;
 use maki_config::load_env_files;
 use maki_config::project::{self, TrustMode};
@@ -13,6 +14,18 @@ use maki_storage::StateDir;
 use crate::interrupt::Interrupt;
 use crate::provider_scripts;
 use crate::setup;
+
+pub fn run_multiplex() -> Result<()> {
+    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    setup::init_logging(&maki_config::StorageConfig::default(), &cwd);
+    setup::install_panic_log_hook();
+
+    let command = ChildCommand::new(
+        env::current_exe().context("resolve the maki executable")?,
+        env::args_os().skip(1),
+    );
+    maki_acp::multiplex::run(Arc::new(move |cwd| command.spawn(cwd)))
+}
 
 pub fn run(
     model_arg: Option<String>,

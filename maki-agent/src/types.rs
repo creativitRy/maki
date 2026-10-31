@@ -643,6 +643,8 @@ pub enum SessionEndReason {
     Load,
     /// The tab was closed.
     Delete,
+    /// An ACP client closed the live session; the stored session stays.
+    Closed,
     /// The process is exiting.
     Shutdown,
     /// `/reload` is rebuilding the plugin host. The session carries on in the

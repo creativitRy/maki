@@ -195,10 +195,13 @@ Uses the same install locations as the install scripts.
 maki acp
 maki acp -m anthropic/claude-sonnet-4-6
 maki acp --yolo
+maki acp --multiplex
 maki --no-jit acp
 ```
 
-Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model` and `--yolo`. Global flags like `--no-jit` must come before the subcommand.
+Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model`, `--yolo`, and `--multiplex`. Global flags like `--no-jit` must come before the subcommand.
+
+`--multiplex` runs one child `maki acp` per session. See [multiple sessions](/docs/acp/#multiple-sessions).
 
 ### `maki index`
 

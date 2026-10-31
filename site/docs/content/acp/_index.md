@@ -55,10 +55,11 @@ asks, so trust a project with `maki trust add` in it, or start the server with
 maki acp
 maki acp -m anthropic/claude-sonnet-4-6
 maki acp --yolo
+maki acp --multiplex
 maki --no-jit acp
 ```
 
-`maki acp` only takes `-m` / `--model` and `--yolo` as subcommand flags. Global flags like `--no-jit` must come before the subcommand (`maki --no-jit acp`, not `maki acp --no-jit`).
+`maki acp` only takes `-m` / `--model`, `--yolo`, and `--multiplex` as subcommand flags. Global flags like `--no-jit` must come before the subcommand (`maki --no-jit acp`, not `maki acp --no-jit`).
 
 Plan mode in ACP uses the same state-directory plan files as the TUI (`…/plans/<slug>.md`), not the SDK's `./plan.md`.
 
@@ -69,3 +70,36 @@ Plan mode in ACP uses the same state-directory plan files as the TUI (`…/plans
 Moves are on unless you pass `--background-timeout 0`, which turns them off. ACP only checks whether they are on, since results arrive with the next prompt. It is a global flag: `maki --background-timeout 0 acp`. See [Background Tasks](/docs/background-tasks/#headless-sdk-and-acp).
 
 SIGINT or SIGTERM closes the session like the end of input, then exits with 130 or 143.
+
+## Multiple sessions
+
+Plain `maki acp` runs one session at a time, so a new session replaces the old one. Editors like JetBrains Air open many chats in one agent process. Start the server with `--multiplex` to give each session its own `maki acp` child:
+
+```bash
+maki acp --multiplex
+```
+
+The shim answers `initialize` and starts a child on `session/new` or `session/load`, in the working directory the editor sends for that session. The child starts there, so the project's config, instructions, Lua plugins, and tool paths apply from the first prompt. Each message about a session goes to its own child.
+
+```json
+"agent_servers": {
+  "Maki": {
+    "type": "custom",
+    "command": "maki",
+    "args": ["acp", "--multiplex"],
+    "env": {}
+  }
+}
+```
+
+The shim keeps its own working directory and uses it only to start children. Without `--multiplex`, a client that launches Maki outside the project (Air does) runs every session in that launch directory.
+
+### Lifetime
+
+A child lives until its session is closed with `session/close` or the shim stops. Closing a chat sends `session/close`. The child exits, and the stored session stays loadable. Air stops an idle shim after two minutes, which shuts down its children too.
+
+An editor that neither closes sessions nor stops the agent keeps one child per chat it ever opened. Each child loads the Lua host, the config, and its own MCP servers, so memory grows with the number of open chats.
+
+### MCP servers
+
+Servers injected by the client reach each child unchanged. Every child starts its own copy, the same way plain `maki acp` does. Sharing a single MCP connection across sessions is not implemented yet.

@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
 use std::io::Write;
 use std::iter;
 use std::path::{Path, PathBuf};
@@ -6,14 +8,15 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol_schema::v1::{
-    AgentNotification, AgentRequest, AgentResponse, ConfigOptionUpdate, ContentBlock,
-    CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError, ImageContent,
-    InitializeRequest, JsonRpcMessage, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, McpServer, NewSessionRequest, Notification, PromptRequest, PromptResponse,
-    Request, RequestId, RequestPermissionRequest, RequestPermissionResponse, Response,
-    SessionConfigOptionValue, SessionId, SessionInfo, SessionModeId, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent, ToolCallStatus,
+    AgentNotification, AgentRequest, AgentResponse, CloseSessionRequest, CloseSessionResponse,
+    ConfigOptionUpdate, ContentBlock, CurrentModeUpdate, EmbeddedResourceResource,
+    Error as AcpError, ImageContent, InitializeRequest, JsonRpcMessage, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, McpServer, NewSessionRequest, Notification,
+    PromptRequest, PromptResponse, Request, RequestId, RequestPermissionRequest,
+    RequestPermissionResponse, Response, SessionConfigOptionValue, SessionId, SessionInfo,
+    SessionModeId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TextContent, ToolCallStatus,
 };
 use color_eyre::eyre::Context;
 use flume::{Sender, WeakSender};
@@ -287,6 +290,7 @@ async fn handle_request(
         "session/new" => new_session(srv, raw, params).await,
         "session/load" => load_session(srv, raw, params).await,
         "session/list" => list_sessions(raw, &params.storage).await,
+        "session/close" => close_requested_session(srv, raw).await,
         "session/prompt" => match handle_prompt(srv, raw, &id) {
             Ok(()) => return,
             Err(e) => Err(e),
@@ -455,6 +459,25 @@ fn iso_from_epoch(secs: u64) -> Option<String> {
         .map(|t| t.to_string())
 }
 
+/// The stored session stays; only the live run ends. `close_session` releases
+/// the claim before the answer goes out, so a client that loads the id right
+/// after finds it free.
+async fn close_requested_session(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
+    let req: CloseSessionRequest = parse_params(raw)?;
+    let requested = req.session_id.0.as_ref();
+    let owned = srv
+        .session
+        .as_ref()
+        .is_some_and(|state| state.handle.session_id.as_str() == requested);
+    if !owned {
+        return Err(AcpError::resource_not_found(Some(requested.to_owned())));
+    }
+    close_session(srv, SessionEndReason::Closed).await;
+    Ok(AgentResponse::CloseSessionResponse(
+        CloseSessionResponse::new(),
+    ))
+}
+
 /// Spawns a session and installs it as the server's current one. Spawning
 /// alone is not a useful state: the event stream has exactly one reader, so it
 /// must be handed to the pump here rather than travel any further.
@@ -611,30 +634,56 @@ fn injected_servers(servers: &[McpServer]) -> Vec<(String, RawTransport)> {
     servers
         .iter()
         .filter_map(|server| match server {
-            McpServer::Http(http) => Some((
-                server_name(&http.name),
-                RawTransport::Http(RawHttpFields {
-                    url: http.url.clone(),
-                    headers: pairs(&http.headers, |h| (&h.name, &h.value)),
-                    oauth: None,
-                    ca_file: None,
-                }),
-            )),
-            McpServer::Stdio(stdio) => Some((
-                server_name(&stdio.name),
-                RawTransport::Stdio(RawStdioFields {
-                    command: iter::once(stdio.command.to_string_lossy().into_owned())
-                        .chain(stdio.args.iter().cloned())
-                        .collect(),
-                    environment: pairs(&stdio.env, |e| (&e.name, &e.value)),
-                }),
-            )),
+            McpServer::Http(http) => {
+                let name = server_name(&http.name);
+                log_injected(&name, "http", server);
+                Some((
+                    name,
+                    RawTransport::Http(RawHttpFields {
+                        url: http.url.clone(),
+                        headers: pairs(&http.headers, |h| (&h.name, &h.value)),
+                        oauth: None,
+                        ca_file: None,
+                    }),
+                ))
+            }
+            McpServer::Stdio(stdio) => {
+                let name = server_name(&stdio.name);
+                log_injected(&name, "stdio", server);
+                Some((
+                    name,
+                    RawTransport::Stdio(RawStdioFields {
+                        command: iter::once(stdio.command.to_string_lossy().into_owned())
+                            .chain(stdio.args.iter().cloned())
+                            .collect(),
+                        environment: pairs(&stdio.env, |e| (&e.name, &e.value)),
+                    }),
+                ))
+            }
             _ => {
                 warn!("ignoring injected MCP server, only http and stdio are supported");
                 None
             }
         })
         .collect()
+}
+
+/// The definition hashed whole: two chats run different copies of the same
+/// server under the same name, and only the settings tell them apart. Env and
+/// headers carry tokens, so they never reach the log. `DefaultHasher` uses
+/// fixed keys, and the payload serializes in wire order, so the same definition
+/// hashes the same in every process.
+fn log_injected(name: &str, transport: &str, server: &McpServer) {
+    let mut hasher = DefaultHasher::new();
+    if let Ok(bytes) = serde_json::to_vec(server) {
+        hasher.write(&bytes);
+    }
+    info!(
+        name = %name,
+        transport = %transport,
+        definition = %format!("{:016x}", hasher.finish()),
+        "client injected MCP server"
+    );
 }
 
 /// Clients name their servers freely, maki names them like `mcp.toml` does.
@@ -931,8 +980,8 @@ fn extract_prompt_content(blocks: &[ContentBlock]) -> (String, Vec<ImageSource>)
         match block {
             ContentBlock::Text(TextContent { text: t, .. }) => append(&mut text, t),
             ContentBlock::Image(ImageContent {
-                data, mime_type, ..
-            }) => images.push(ImageSource::new(
+                                    data, mime_type, ..
+                                }) => images.push(ImageSource::new(
                 image_media_type(mime_type),
                 Arc::from(data.as_str()),
             )),
@@ -992,8 +1041,8 @@ fn start_event_pump(
         let mut in_flight: Vec<String> = Vec::new();
 
         while let Some(Envelope {
-            event, subagent, ..
-        }) = events.next().await
+                           event, subagent, ..
+                       }) = events.next().await
         {
             // A subagent's turn spends session money even though its events
             // stay out of the transcript.
@@ -1317,7 +1366,7 @@ mod tests {
             maki_dir.join("permissions.toml"),
             format!("[bash]\ndeny = [\"{DENY_SCOPE}\"]\nallow = [\"{ALLOW_SCOPE}\"]\n"),
         )
-        .unwrap();
+            .unwrap();
         let storage = StateDir::from_path(state.path().to_path_buf());
 
         let untrusted = trusted_project_config(
@@ -1413,7 +1462,7 @@ mod tests {
             paths: Some(vec![pattern.to_owned()]),
             prompt: Some(false),
         })
-        .expect("valid trust pattern")
+            .expect("valid trust pattern")
     }
 
     /// The container image's global `init.lua` is the only thing that can
@@ -1480,9 +1529,12 @@ mod tests {
     }
 
     #[test_case(allow_once(ANSWERED_ID), PermissionAnswer::AllowOnce ; "selected_option")]
-    #[test_case(serde_json::json!({ "id": ANSWERED_ID, "result": { "outcome": { "outcome": "cancelled" } } }), PermissionAnswer::Deny ; "cancelled_outcome")]
-    #[test_case(serde_json::json!({ "id": ANSWERED_ID, "result": { "nonsense": true } }), PermissionAnswer::Deny ; "unparsable_result")]
-    #[test_case(serde_json::json!({ "id": ANSWERED_ID, "error": { "code": -32603 } }), PermissionAnswer::Deny ; "jsonrpc_error")]
+    #[test_case(serde_json::json!({ "id": ANSWERED_ID, "result": { "outcome": { "outcome": "cancelled" } } }), PermissionAnswer::Deny ; "cancelled_outcome"
+    )]
+    #[test_case(serde_json::json!({ "id": ANSWERED_ID, "result": { "nonsense": true } }), PermissionAnswer::Deny ; "unparsable_result"
+    )]
+    #[test_case(serde_json::json!({ "id": ANSWERED_ID, "error": { "code": -32603 } }), PermissionAnswer::Deny ; "jsonrpc_error"
+    )]
     fn permission_answer_maps_response(raw: Value, expected: PermissionAnswer) {
         assert_eq!(permission_answer(&raw), expected);
     }
@@ -1622,6 +1674,7 @@ mod tests {
     const CHILD_NOTICE_LINE: &str = "a child's own notice";
     const HOST_NOTICE: &str = "the prompt changed, so the cache starts over";
     const PROMPT_ID: i64 = 7;
+    const CLOSE_REQUEST_ID: i64 = 8;
     const SUBAGENT_COST: f64 = 0.25;
     const TURN_COST: f64 = 0.5;
     const LEDGER_COST: f64 = 0.75;
@@ -2240,7 +2293,8 @@ mod tests {
         }
     }
 
-    #[test_case(Some(ESCALATION_REASON), ESCALATED_PERMISSION_TITLE ; "a_plugin_reason_leads_the_title")]
+    #[test_case(Some(ESCALATION_REASON), ESCALATED_PERMISSION_TITLE ; "a_plugin_reason_leads_the_title"
+    )]
     #[test_case(None, MAIN_PERMISSION_TITLE ; "no_reason_keeps_the_plain_title")]
     #[tokio::test]
     async fn permission_title_carries_the_escalation_reason(reason: Option<&str>, title: &str) {
@@ -2381,6 +2435,122 @@ mod tests {
             Some((ended, SessionEndReason::Replaced))
         );
         assert!(srv.session.is_none(), "close must take the session");
+    }
+
+    /// The prompt answer must precede the close answer, so a client that reads
+    /// them in order sees the turn cancelled before its session is gone.
+    #[tokio::test]
+    async fn closing_a_session_cancels_its_prompt_before_it_answers() {
+        let tmp = TempDir::new().unwrap();
+        let (mut srv, _, out_rx, _) = test_server();
+        let session = srv.session.as_ref().unwrap().handle.session_id.clone();
+        let (ended_tx, ended_rx) = flume::bounded(1);
+        srv.on_session_end = Some(Arc::new(move |id, reason| {
+            let ended_tx = ended_tx.clone();
+            Box::pin(async move {
+                let _ = ended_tx.send((id, reason));
+            })
+        }));
+        pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
+        let request = serde_json::json!({ "params": { "sessionId": session.to_string() } });
+
+        handle_request(
+            &mut srv,
+            "session/close",
+            RequestId::Number(CLOSE_REQUEST_ID),
+            &request,
+            &acp_params(StateDir::from_path(tmp.path().to_path_buf())),
+        )
+        .await;
+
+        let cancelled = out_rx.try_recv().expect("the pending prompt is answered");
+        assert_eq!(cancelled["id"], PROMPT_ID);
+        assert_eq!(cancelled["result"]["stopReason"], "cancelled");
+        let closed = out_rx.try_recv().expect("the close is acknowledged");
+        assert_eq!(closed["id"], CLOSE_REQUEST_ID);
+        assert_eq!(
+            ended_rx.try_recv().ok(),
+            Some((session.id(), SessionEndReason::Closed))
+        );
+        assert!(srv.session.is_none(), "close must take the session");
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_the_server_does_not_own_is_resource_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let (mut srv, _, out_rx, _) = test_server();
+        let request =
+            serde_json::json!({ "params": { "sessionId": MakiId::generate().to_string() } });
+
+        handle_request(
+            &mut srv,
+            "session/close",
+            RequestId::Number(CLOSE_REQUEST_ID),
+            &request,
+            &acp_params(StateDir::from_path(tmp.path().to_path_buf())),
+        )
+        .await;
+
+        let answer = out_rx.try_recv().expect("the client is answered");
+        assert_eq!(
+            answer["error"]["code"],
+            i32::from(AcpError::resource_not_found(None).code)
+        );
+        assert!(srv.session.is_some(), "the running session must survive");
+    }
+
+    /// The claim is released before the close answer goes out, so a load right
+    /// after the response finds the id free.
+    #[tokio::test]
+    async fn a_closed_session_is_loadable_again() {
+        let tmp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let mut stored: Session<Message, TokenUsage, ToolOutput> =
+            Session::new(SELECTED_SPEC, "/project");
+        let claim = SessionClaim::acquire(stored.id, &storage).unwrap();
+        stored.save(&claim, &storage).unwrap();
+        let (mut srv, ..) = test_server();
+        let state = srv.session.as_mut().unwrap();
+        state.handle.session_id = SessionRef::from(claim.id());
+        state.claim = claim;
+        let request = serde_json::json!({ "params": { "sessionId": stored.id.to_string() } });
+
+        handle_request(
+            &mut srv,
+            "session/close",
+            RequestId::Number(CLOSE_REQUEST_ID),
+            &request,
+            &acp_params(storage.clone()),
+        )
+        .await;
+
+        assert!(srv.session.is_none());
+        assert!(
+            claim_history(&storage, stored.id).is_ok(),
+            "a closed session stays loadable"
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_session_close() {
+        let tmp = TempDir::new().unwrap();
+        let (mut srv, _, out_rx, _) = test_server();
+
+        handle_request(
+            &mut srv,
+            "initialize",
+            RequestId::Number(CLOSE_REQUEST_ID),
+            &serde_json::json!({ "params": {} }),
+            &acp_params(StateDir::from_path(tmp.path().to_path_buf())),
+        )
+        .await;
+
+        let answer = out_rx.try_recv().expect("initialize is answered");
+        let capabilities = &answer["result"]["agentCapabilities"]["sessionCapabilities"];
+        assert!(
+            capabilities["close"].is_object(),
+            "a client only sends session/close once it is advertised: {answer}"
+        );
     }
 
     /// JSON-RPC ids are `string | number`, and a client is free to echo ours

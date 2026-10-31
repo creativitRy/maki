@@ -254,15 +254,23 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Rollback) => {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
-        Some(Command::Acp { model, yolo }) => {
-            acp::run(
-                model,
-                yolo,
-                cli.no_plugins,
-                cli.no_jit,
-                trust_mode,
-                background,
-            )?;
+        Some(Command::Acp {
+            model,
+            yolo,
+            multiplex,
+        }) => {
+            if multiplex {
+                acp::run_multiplex()?;
+            } else {
+                acp::run(
+                    model,
+                    yolo,
+                    cli.no_plugins,
+                    cli.no_jit,
+                    trust_mode,
+                    background,
+                )?;
+            }
         }
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,
