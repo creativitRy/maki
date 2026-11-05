@@ -16,6 +16,16 @@ use serde_json::Value;
 /// text regardless of frontend.
 pub const DISMISSED: &str = "(question dismissed by user)";
 const NO_ANSWER: &str = "(no answer)";
+const CUSTOM_KEY_SUFFIX: &str = "_custom";
+const CUSTOM_TITLE: &str = "Other";
+const CUSTOM_DESCRIPTION: &str =
+    "Type your own answer instead of choosing one of the options (optional).";
+const JETBRAINS_META_KEY: &str = "jetbrains";
+const AIR_META_KEY: &str = "air";
+const AIR_CUSTOM_ANSWER_KEY: &str = "customAnswer";
+const LEGACY_AIR_CUSTOM_ANSWER_KEY: &str = "_askUserQuestionCustomAnswer";
+const AIR_EXTENSION_VERSION_KEY: &str = "version";
+const AIR_EXTENSION_VERSION: u64 = 1;
 
 #[derive(Deserialize)]
 struct Question {
@@ -75,12 +85,43 @@ fn property(q: &Question) -> ElicitationPropertySchema {
     }
 }
 
-/// Property keys are positional (`q1`, `q2`, ...) so answers map back to
-/// questions even when headers repeat or are missing.
-fn key(index: usize) -> String {
-    format!("q{}", index + 1)
+/// The write-in row clients render beside the options. Without a plain string
+/// sibling, a single-select renders as radio buttons only.
+///
+/// The `_meta` marker is what makes a JetBrains client fold the field into the
+/// preceding select as its write-in; unmarked, the field is a form page of its
+/// own. AIR does not advertise `jetbrains.air` in its capabilities, so the
+/// marker goes out unconditionally — `_meta` is an extension object other
+/// clients ignore.
+fn custom_property(question_key: &str) -> ElicitationPropertySchema {
+    let marker = serde_json::json!({ "questionId": question_key, "isCustomAnswer": true });
+    let mut air = serde_json::Map::new();
+    air.insert(AIR_EXTENSION_VERSION_KEY.to_owned(), AIR_EXTENSION_VERSION.into());
+    air.insert(AIR_CUSTOM_ANSWER_KEY.to_owned(), marker.clone());
+    let mut meta = serde_json::Map::new();
+    meta.insert(LEGACY_AIR_CUSTOM_ANSWER_KEY.to_owned(), marker);
+    meta.insert(
+        JETBRAINS_META_KEY.to_owned(),
+        serde_json::json!({ AIR_META_KEY: serde_json::Value::Object(air) }),
+    );
+    ElicitationPropertySchema::String(
+        StringPropertySchema::new()
+            .title(CUSTOM_TITLE)
+            .description(CUSTOM_DESCRIPTION)
+            .meta(meta),
+    )
 }
 
+/// Property keys are positional (`question_0`, `question_1`, ...) so answers
+/// map back to questions even when headers repeat or are missing. The ids stay
+/// opaque to clients: the write-in is recognized by its `_meta`, not its name.
+fn key(index: usize) -> String {
+    format!("question_{index}")
+}
+
+fn custom_key(index: usize) -> String {
+    key(index) + CUSTOM_KEY_SUFFIX
+}
 pub fn form_request(
     session_id: &str,
     tool_call_id: Option<String>,
@@ -92,11 +133,17 @@ pub fn form_request(
     }
 
     let mut schema = ElicitationSchema::new();
-    schema.properties = questions
-        .iter()
-        .enumerate()
-        .map(|(i, q)| (key(i), property(q)))
-        .collect();
+    for (i, question) in questions.iter().enumerate() {
+        let property_key = key(i);
+        schema
+            .properties
+            .insert(property_key.clone(), property(question));
+        if !question.options.is_empty() {
+            schema
+                .properties
+                .insert(custom_key(i), custom_property(&property_key));
+        }
+    }
 
     let scope = ElicitationSessionScope::new(SessionId::from(session_id.to_owned()))
         .tool_call_id(tool_call_id.map(ToolCallId::from));
@@ -111,14 +158,20 @@ pub fn form_request(
 }
 
 fn answer_text(value: Option<&ElicitationContentValue>) -> Option<String> {
-    match value? {
-        ElicitationContentValue::String(s) if !s.is_empty() => Some(s.clone()),
-        ElicitationContentValue::StringArray(items) if !items.is_empty() => Some(items.join(", ")),
-        ElicitationContentValue::Integer(n) => Some(n.to_string()),
-        ElicitationContentValue::Number(n) => Some(n.to_string()),
-        ElicitationContentValue::Boolean(b) => Some(b.to_string()),
-        _ => None,
-    }
+    let text = match value? {
+        ElicitationContentValue::String(s) => s.trim().to_owned(),
+        ElicitationContentValue::StringArray(items) => items
+            .iter()
+            .map(|item| item.trim())
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>()
+            .join(", "),
+        ElicitationContentValue::Integer(n) => n.to_string(),
+        ElicitationContentValue::Number(n) => n.to_string(),
+        ElicitationContentValue::Boolean(b) => b.to_string(),
+        _ => return None,
+    };
+    (!text.is_empty()).then_some(text)
 }
 
 /// Turns the client's `elicitation/create` result into the same markdown the
@@ -152,7 +205,18 @@ pub fn format_response(input: &Value, raw_result: &str) -> String {
             } else {
                 q.header.clone()
             };
-            let answer = answer_text(content.get(&key(i))).unwrap_or_else(|| NO_ANSWER.to_owned());
+            // The pick and the write-in are one answer: a client that folds
+            // the typed text into the select field sends one, a client that
+            // keeps the companion field sends both.
+            let parts = [key(i), custom_key(i)]
+                .into_iter()
+                .filter_map(|k| answer_text(content.get(&k)))
+                .collect::<Vec<_>>();
+            let answer = if parts.is_empty() {
+                NO_ANSWER.to_owned()
+            } else {
+                parts.join(", ")
+            };
             format!("{label}: {answer}")
         })
         .collect::<Vec<_>>()
@@ -161,7 +225,10 @@ pub fn format_response(input: &Value, raw_result: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use agent_client_protocol_schema::v1::ElicitationScope;
+    use agent_client_protocol_schema::v1::{
+        ElicitationCapabilities, ElicitationFormCapabilities, ElicitationScope,
+        ElicitationUrlCapabilities,
+    };
     use test_case::test_case;
 
     use super::*;
@@ -205,11 +272,25 @@ mod tests {
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["mode"], "form");
         let props = &json["requestedSchema"]["properties"];
-        assert_eq!(props["q1"]["type"], "string");
-        assert_eq!(props["q1"]["oneOf"][0]["const"], "axum");
-        assert_eq!(props["q2"]["type"], "array");
-        assert_eq!(props["q3"]["type"], "string");
-        assert!(props["q3"].get("oneOf").is_none());
+        assert_eq!(props["question_0"]["type"], "string");
+        assert_eq!(props["question_0"]["oneOf"][0]["const"], "axum");
+        assert_eq!(props["question_1"]["type"], "array");
+        assert_eq!(props["question_2"]["type"], "string");
+        assert!(props["question_2"].get("oneOf").is_none());
+        for index in 0..2 {
+            let custom = &props[custom_key(index)];
+            assert_eq!(custom["type"], "string");
+            assert_eq!(custom["title"], CUSTOM_TITLE);
+            assert!(custom.get("oneOf").is_none());
+            let marker = &custom["_meta"][JETBRAINS_META_KEY][AIR_META_KEY][AIR_CUSTOM_ANSWER_KEY];
+            assert_eq!(marker["questionId"], key(index));
+            assert_eq!(marker["isCustomAnswer"], true);
+            assert_eq!(
+                custom["_meta"][LEGACY_AIR_CUSTOM_ANSWER_KEY]["isCustomAnswer"],
+                true
+            );
+        }
+        assert!(props.get(custom_key(2)).is_none());
     }
 
     #[test]
@@ -229,7 +310,7 @@ mod tests {
     fn accept_response_formats_answers() {
         let raw = serde_json::json!({
             "action": "accept",
-            "content": { "q1": "axum", "q2": ["auth", "uploads"] }
+            "content": { "question_0": "axum", "question_1": ["auth", "uploads"] }
         })
         .to_string();
         assert_eq!(
@@ -242,13 +323,48 @@ mod tests {
     fn nulled_out_field_costs_one_answer_not_the_form() {
         let raw = serde_json::json!({
             "action": "accept",
-            "content": { "q1": "axum", "q2": null }
+            "content": { "question_0": "axum", "question_1": null }
         })
         .to_string();
         assert_eq!(
             format_response(&questions_input(), &raw),
             "Framework: axum\nFeatures: (no answer)\nQ3: (no answer)"
         );
+    }
+
+    #[test_case(
+        serde_json::json!({ "question_0_custom": "something else" }),
+        "Framework: something else\nFeatures: (no answer)\nQ3: (no answer)" ; "write_in_only"
+    )]
+    #[test_case(
+        serde_json::json!({ "question_0": "axum", "question_0_custom": "but add tests" }),
+        "Framework: axum, but add tests\nFeatures: (no answer)\nQ3: (no answer)" ; "pick_and_write_in"
+    )]
+    #[test_case(
+        serde_json::json!({ "question_1": [], "question_1_custom": "custom" }),
+        "Framework: (no answer)\nFeatures: custom\nQ3: (no answer)" ; "empty_pick_with_write_in"
+    )]
+    #[test_case(
+        serde_json::json!({ "question_0_custom": "   " }),
+        "Framework: (no answer)\nFeatures: (no answer)\nQ3: (no answer)" ; "whitespace_only_write_in"
+    )]
+    #[test_case(
+        serde_json::json!({ "question_1": [" auth ", ""] }),
+        "Framework: (no answer)\nFeatures: auth\nQ3: (no answer)" ; "picks_are_trimmed"
+    )]
+    fn accept_response_folds_write_in_into_the_answer(content: Value, expected: &str) {
+        let raw = serde_json::json!({ "action": "accept", "content": content }).to_string();
+        assert_eq!(format_response(&questions_input(), &raw), expected);
+    }
+
+    #[test]
+    fn write_in_is_ignored_when_the_form_is_declined() {
+        let raw = serde_json::json!({
+            "action": "decline",
+            "content": { "question_0_custom": "never sent" }
+        })
+        .to_string();
+        assert_eq!(format_response(&questions_input(), &raw), DISMISSED);
     }
 
     #[test_case(r#"{"action":"decline"}"# ; "decline")]
@@ -261,16 +377,13 @@ mod tests {
 
     #[test]
     fn supports_form_requires_form_capability() {
+        let with_form = ClientCapabilities::new()
+            .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()));
+        let url_only = ClientCapabilities::new()
+            .elicitation(ElicitationCapabilities::new().url(ElicitationUrlCapabilities::new()));
+
         assert!(!supports_form(&ClientCapabilities::default()));
-        let caps: ClientCapabilities = serde_json::from_value(serde_json::json!({
-            "elicitation": { "form": {} }
-        }))
-        .unwrap();
-        assert!(supports_form(&caps));
-        let url_only: ClientCapabilities = serde_json::from_value(serde_json::json!({
-            "elicitation": { "url": {} }
-        }))
-        .unwrap();
+        assert!(supports_form(&with_form));
         assert!(!supports_form(&url_only));
     }
 }
