@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -134,6 +134,10 @@ pub struct McpConfig {
     /// 0 always defers, a large value disables deferral.
     #[serde(default)]
     pub defer_tools: Option<usize>,
+    /// Server names whose tools skip `tool_search` and load upfront, including
+    /// servers declared at runtime (for example over ACP).
+    #[serde(default)]
+    pub always_load: HashSet<String>,
     #[serde(default)]
     pub mcp: HashMap<String, RawServerConfig>,
     #[serde(skip)]
@@ -416,6 +420,7 @@ fn merge_config(merged: &mut McpConfig, errors: &mut McpConfigErrors, path: &Pat
                 merged.origins.insert(name.clone(), path.to_path_buf());
             }
             merged.defer_tools = cfg.defer_tools.or(merged.defer_tools);
+            merged.always_load.extend(cfg.always_load);
             merged.mcp.extend(cfg.mcp);
         }
         Err(e) => errors.add_error(e),
@@ -522,6 +527,8 @@ mod tests {
     use test_case::test_case;
 
     const CONFIG_PATH: &str = "/etc/maki/mcp.toml";
+    const GLOBAL_ALWAYS_LOAD_SERVER: &str = "ide";
+    const PROJECT_ALWAYS_LOAD_SERVER: &str = "workspace";
 
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {
         RawServerConfig {
@@ -970,5 +977,82 @@ command = ["echo", "hello"]
         .unwrap();
         let cfg = read_config(&path).unwrap().unwrap();
         assert!(cfg.mcp.contains_key("valid"));
+    }
+
+    #[test]
+    fn merge_config_unions_always_load_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.toml");
+        let project = dir.path().join("project.toml");
+        fs::write(
+            &global,
+            format!("always_load = [\"{GLOBAL_ALWAYS_LOAD_SERVER}\"]\n"),
+        )
+        .unwrap();
+        fs::write(
+            &project,
+            format!("always_load = [\"{PROJECT_ALWAYS_LOAD_SERVER}\"]\n"),
+        )
+        .unwrap();
+
+        let mut merged = McpConfig::default();
+        let mut errors = McpConfigErrors::new(dir.path().to_path_buf());
+        merge_config(&mut merged, &mut errors, &global);
+        merge_config(&mut merged, &mut errors, &project);
+
+        assert!(errors.is_empty());
+        assert!(merged.is_empty());
+        assert_eq!(
+            merged.always_load,
+            HashSet::from([
+                GLOBAL_ALWAYS_LOAD_SERVER.into(),
+                PROJECT_ALWAYS_LOAD_SERVER.into(),
+            ])
+        );
+    }
+
+    #[test]
+    fn load_config_gates_project_always_load_behind_folder_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.toml");
+        fs::write(
+            &global,
+            format!("always_load = [\"{GLOBAL_ALWAYS_LOAD_SERVER}\"]\n"),
+        )
+        .unwrap();
+
+        let project_dir = dir.path().join("project");
+        let project_maki_dir = project_dir.join(".maki");
+        fs::create_dir_all(&project_maki_dir).unwrap();
+        fs::write(
+            project_maki_dir.join(MCP_CONFIG_FILE),
+            format!("always_load = [\"{PROJECT_ALWAYS_LOAD_SERVER}\"]\n"),
+        )
+        .unwrap();
+
+        let (untrusted, errors) = load_config_inner(
+            &project_dir,
+            Some(&global),
+            ProjectConfig::discover(&project_dir),
+        );
+        assert!(errors.is_empty());
+        assert_eq!(
+            untrusted.always_load,
+            HashSet::from([GLOBAL_ALWAYS_LOAD_SERVER.into()])
+        );
+
+        let (trusted, errors) = load_config_inner(
+            &project_dir,
+            Some(&global),
+            project::resolve_noninteractive(&project_dir, TrustMode::Session).project_config,
+        );
+        assert!(errors.is_empty());
+        assert_eq!(
+            trusted.always_load,
+            HashSet::from([
+                GLOBAL_ALWAYS_LOAD_SERVER.into(),
+                PROJECT_ALWAYS_LOAD_SERVER.into(),
+            ])
+        );
     }
 }

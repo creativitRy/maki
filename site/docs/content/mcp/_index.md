@@ -83,11 +83,12 @@ Maki checks certificates against the operating system's trust store, so a CA tha
 
 Set `command` for stdio, `url` for HTTP. Pick one.
 
-One option lives at the top level of `mcp.toml`, outside any server:
+Two options live at the top level of `mcp.toml`, outside any server:
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `defer_tools` | usize | 10 | Defer tools only when more than this many exist. Ignored with [native tool search](#loads-and-the-prompt-cache), which always defers |
+| `always_load` | string[] | [] | Server names whose tools load upfront, including runtime servers passed at session start (for example over ACP) |
 
 ## Tool search
 
@@ -155,6 +156,14 @@ always_load = true
 ```
 
 Good for small servers you rely on every turn. On a big server it defeats the point: every definition is back in your context on every request.
+
+For servers injected at runtime (such as ephemeral servers passed over ACP `session/new` or `session/load`), list their names in the top-level `always_load` array instead:
+
+```toml
+always_load = ["ide"]
+```
+
+Global and trusted project lists merge together, and names without a matching server have no effect.
 
 ## Naming and namespacing
 

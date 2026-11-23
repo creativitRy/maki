@@ -849,17 +849,24 @@ pub async fn start_with_extra(
     let owned_cwd = cwd.to_owned();
     let (mut config, config_errors) =
         blocking(move || load_config(&owned_cwd, project_config)).await;
+    merge_runtime_servers(&mut config, extra);
+    (start_with_config(config), config_errors)
+}
+
+fn merge_runtime_servers(config: &mut McpConfig, extra: Vec<(String, RawTransport)>) {
     for (name, transport) in extra {
+        let always_load = config.always_load.contains(&name);
         match config.mcp.entry(name) {
             Entry::Vacant(slot) => {
-                slot.insert(RawServerConfig::runtime(transport));
+                let mut raw = RawServerConfig::runtime(transport);
+                raw.always_load = always_load;
+                slot.insert(raw);
             }
             Entry::Occupied(slot) => {
                 warn!(server = slot.key(), "runtime MCP server already configured");
             }
         }
     }
-    (start_with_config(config), config_errors)
 }
 
 pub fn start_with_config(config: McpConfig) -> Option<McpHandle> {
@@ -1129,9 +1136,11 @@ async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
 
 fn parse_entries(config: McpConfig) -> McpManagerInner {
     let origins = config.origins;
+    let always_load = config.always_load;
     let mut entries = Vec::with_capacity(config.mcp.len());
 
-    for (name, raw) in config.mcp {
+    for (name, mut raw) in config.mcp {
+        raw.always_load |= always_load.contains(&name);
         let transport_kind = transport_kind(&raw.transport);
         let origin = origins.get(&name).cloned().unwrap_or_default();
         let disabled = !raw.enabled;
@@ -1492,6 +1501,10 @@ mod tests {
     const MCP_TOML: &str = "mcp.toml";
     const SERVER: &str = "srv";
     const CHALLENGE: &str = r#"Bearer resource_metadata="https://srv.example/.well-known""#;
+    const RUNTIME_URL: &str = "http://127.0.0.1:9999/mcp";
+    const RUNTIME_ALWAYS_LOAD_SERVER: &str = "ide";
+    const RUNTIME_DEFERRED_SERVER: &str = "other";
+    const GHOST_ALWAYS_LOAD_SERVER: &str = "ghost";
 
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {
         RawServerConfig {
@@ -2454,5 +2467,56 @@ mod tests {
             prompt.resolve("x").unwrap_err(),
             format!("{USAGE_PREFIX} /{PROMPT_DISPLAY} <{ARG_B}>")
         );
+    }
+
+    fn runtime_http_transport(url: &str) -> RawTransport {
+        RawTransport::Http(RawHttpFields {
+            url: url.into(),
+            headers: HashMap::new(),
+            oauth: None,
+            ca_file: None,
+        })
+    }
+
+    fn runtime_stdio_transport(cmd: &[&str]) -> RawTransport {
+        RawTransport::Stdio(RawStdioFields {
+            command: cmd.iter().map(|s| (*s).to_owned()).collect(),
+            environment: HashMap::new(),
+        })
+    }
+
+    #[test_case(RUNTIME_ALWAYS_LOAD_SERVER, true,  true  ; "http_listed_in_always_load")]
+    #[test_case(RUNTIME_ALWAYS_LOAD_SERVER, false, true  ; "stdio_listed_in_always_load")]
+    #[test_case(RUNTIME_DEFERRED_SERVER,    true,  false ; "http_unlisted_stays_deferred")]
+    fn merge_runtime_servers_applies_top_level_always_load(
+        name: &str,
+        http: bool,
+        expected_always_load: bool,
+    ) {
+        let mut config = McpConfig {
+            always_load: HashSet::from([RUNTIME_ALWAYS_LOAD_SERVER.into()]),
+            ..Default::default()
+        };
+        let transport = if http {
+            runtime_http_transport(RUNTIME_URL)
+        } else {
+            runtime_stdio_transport(&["echo"])
+        };
+
+        merge_runtime_servers(&mut config, vec![(name.into(), transport)]);
+
+        assert_eq!(config.mcp[name].always_load, expected_always_load);
+    }
+
+    #[test]
+    fn parse_entries_applies_top_level_always_load_without_ghost_entries() {
+        let mut config = make_config(vec![(SERVER, stdio_raw(&["echo"]))]);
+        config.always_load = HashSet::from([SERVER.into(), GHOST_ALWAYS_LOAD_SERVER.into()]);
+
+        let inner = parse_entries(config);
+
+        assert_eq!(inner.entries.len(), 1);
+        assert_eq!(inner.entries[0].name, SERVER);
+        assert!(inner.entries[0].config.as_ref().unwrap().always_load);
     }
 }
