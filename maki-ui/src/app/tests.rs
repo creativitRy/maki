@@ -740,7 +740,7 @@ fn ctrl_c_after_a_copy(between: &[KeyCode]) -> CtrlC {
 }
 
 #[test_case(done(), ExitRequest::Success ; "done_exits_success")]
-#[test_case(AgentEvent::Error { message: "boom".into(), auth: false, totals: RunTotals::default() }, ExitRequest::Error ; "error_exits_error")]
+#[test_case(AgentEvent::Error { message: "boom".into(), auth: false, api: None, totals: RunTotals::default() }, ExitRequest::Error ; "error_exits_error")]
 fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
     let mut app = test_app();
     app.exit_when_done(None);
@@ -999,6 +999,7 @@ fn agent_error_lands_in_chat(message: String, expected: String) {
     app.update(agent_msg(AgentEvent::Error {
         message,
         auth: false,
+        api: None,
         totals: RunTotals::default(),
     }));
     assert_eq!(app.chats[0].last_message_role(), Some(&DisplayRole::Error));
@@ -1097,6 +1098,7 @@ pub(crate) fn error_app(app: &mut App) {
     app.update(agent_msg(AgentEvent::Error {
         message: AGENT_ERROR_MSG.into(),
         auth: false,
+        api: None,
         totals: RunTotals::default(),
     }));
 }
@@ -2474,6 +2476,7 @@ fn agent_error() -> AgentEvent {
     AgentEvent::Error {
         message: AGENT_ERROR_MSG.into(),
         auth: false,
+        api: None,
         totals: RunTotals::default(),
     }
 }
@@ -6170,7 +6173,7 @@ fn streaming_app_with_history() -> App {
 /// next frame's checkpoint syncs the mirror whatever event arrived.
 #[test_case(done() ; "stale_done")]
 #[test_case(
-    AgentEvent::Error { message: "timeout".into(), auth: false, totals: RunTotals::default() } ; "stale_error"
+    AgentEvent::Error { message: "timeout".into(), auth: false, api: None, totals: RunTotals::default() } ; "stale_error"
 )]
 fn checkpoint_after_cancel_persists_the_cancelled_turn(event: AgentEvent) {
     let mut app = streaming_app_with_history();
@@ -6267,6 +6270,7 @@ fn parent_error_refreshes_picker_and_persists_every_child() {
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
         auth: false,
+        api: None,
         totals: RunTotals::default(),
     }));
 
@@ -6354,6 +6358,7 @@ fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
     app.update(agent_msg(AgentEvent::Error {
         message: "provider overloaded".into(),
         auth: false,
+        api: None,
         totals: RunTotals::default(),
     }));
 
@@ -6410,6 +6415,7 @@ fn error_event_matching_run_id_saves_session_and_queued_messages() {
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
         auth: false,
+        api: None,
         totals: RunTotals::default(),
     }));
     app.checkpoint();
@@ -6432,6 +6438,7 @@ fn flush_restored_queue_drops_recovery_snapshot() {
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
         auth: false,
+        api: None,
         totals: RunTotals::default(),
     }));
     app.checkpoint();
@@ -10514,6 +10521,7 @@ fn agent_error_creates_synthetic_tool_done_with_message() {
     app.update(agent_msg(AgentEvent::Error {
         message: error_msg.into(),
         auth: false,
+        api: None,
         totals: RunTotals::default(),
     }));
 
@@ -13071,6 +13079,7 @@ fn exit_on_done_exits_a_failed_turn_without_waiting() {
     app.update(agent_msg(AgentEvent::Error {
         message: AGENT_ERROR_MSG.into(),
         auth: false,
+        api: None,
         totals: RunTotals::default(),
     }));
 

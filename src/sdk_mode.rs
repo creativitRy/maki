@@ -1803,6 +1803,7 @@ mod tests {
             .send(AgentEvent::Error {
                 message: PUMP_ERROR.into(),
                 auth: false,
+                api: None,
                 totals: RunTotals::default(),
             })
             .unwrap();
@@ -2192,6 +2193,7 @@ mod tests {
             AgentEvent::Error {
                 message: PUMP_ERROR.into(),
                 auth: false,
+                api: None,
                 totals: run,
             }
         } else {

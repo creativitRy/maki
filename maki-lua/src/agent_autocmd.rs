@@ -455,6 +455,7 @@ mod tests {
             AgentEvent::Error {
                 message: "boom".into(),
                 auth: false,
+                api: None,
                 totals: RunTotals::default(),
             },
         ]

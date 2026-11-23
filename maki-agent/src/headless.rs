@@ -1523,6 +1523,7 @@ mod tests {
             let _ = event_tx.send(AgentEvent::Error {
                 message: PROVIDER_ERROR.into(),
                 auth: false,
+                api: None,
                 totals: RunTotals::default(),
             });
             Some(track)

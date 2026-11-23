@@ -31,8 +31,9 @@ use maki_agent::session::{Resumed, StoredSession};
 use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience, local_tool};
 use maki_agent::types::AgentEvent;
 use maki_agent::{
-    AgentInput, AgentMode, CancelToken, CostTally, Envelope, HostPrompt, ImageMediaType,
-    ImageSource, InputSource, McpPromptRef, McpSnapshotReader, SessionEndReason, SessionEvents,
+    AgentInput, AgentMode, ApiErrorInfo, CancelToken, CostTally, Envelope, HostPrompt,
+    ImageMediaType, ImageSource, InputSource, McpPromptRef, McpSnapshotReader, SessionEndReason,
+    SessionEvents,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, TrustConfig};
@@ -1477,6 +1478,7 @@ fn start_event_pump(
                 AgentEvent::Error {
                     message,
                     auth,
+                    api,
                     totals,
                 } => {
                     // A turn that dies on a provider 500 never reaches `Done`,
@@ -1498,7 +1500,7 @@ fn start_event_pump(
                         } else {
                             AcpError::internal_error()
                         };
-                        let error = error.data(Value::String(message));
+                        let error = error.data(error_data(message, api));
                         send(&out_tx, Response::<AgentResponse>::new(id, Err(error)));
                     }
                     continue;
@@ -1508,6 +1510,21 @@ fn start_event_pump(
             session_update(&out_tx, &sid, update);
         }
     })
+}
+
+#[derive(Serialize)]
+struct StructuredErrorData {
+    message: String,
+    #[serde(flatten)]
+    api: ApiErrorInfo,
+}
+
+fn error_data(message: String, api: Option<ApiErrorInfo>) -> Value {
+    match api {
+        Some(api) => serde_json::to_value(StructuredErrorData { message, api })
+            .expect("StructuredErrorData serialization cannot fail"),
+        None => Value::String(message),
+    }
 }
 
 /// Takes the client's outstanding `session/prompt`, if any. Its asks stay
@@ -1610,6 +1627,7 @@ mod tests {
     use tokio::sync::watch;
 
     use maki_config::SessionDefaults;
+    use serde_json::json;
     use tempfile::TempDir;
     use test_case::test_case;
     use tokio::sync::Mutex as AsyncMutex;
@@ -1661,6 +1679,10 @@ mod tests {
     const CLOSED_SESSION_SILENT: &str = "no update for a session goes out after its close";
     const CLOSED_ASK_DROPPED: &str = "an answer for a closed session reaches nobody";
     const HOOK_MARKER: &str = "session_end_hook";
+    const API_RATE_LIMIT_STATUS: u16 = 429;
+    const API_UNAVAILABLE_STATUS: u16 = 503;
+    const API_UNAUTHORIZED_STATUS: u16 = 401;
+    const API_RETRY_AFTER_SECS: u64 = 30;
 
     /// Where fixture servers claim their placeholder session. One dir is enough,
     /// since fresh ids never collide and nothing is written under them.
@@ -2571,6 +2593,7 @@ mod tests {
                 .send(AgentEvent::Error {
                     message: TURN_ERROR.to_owned(),
                     auth,
+                    api: None,
                     totals: RunTotals::default(),
                 })
                 .unwrap();
@@ -2583,12 +2606,97 @@ mod tests {
         assert_eq!(answer["error"]["data"], TURN_ERROR);
     }
 
+    fn expected_rate_limit_data() -> Value {
+        json!({
+            "message": TURN_ERROR,
+            "status": API_RATE_LIMIT_STATUS,
+            "retry_after_secs": API_RETRY_AFTER_SECS,
+        })
+    }
+
+    fn expected_unavailable_data() -> Value {
+        json!({
+            "message": TURN_ERROR,
+            "status": API_UNAVAILABLE_STATUS,
+        })
+    }
+
+    fn expected_quota_data() -> Value {
+        json!({
+            "message": TURN_ERROR,
+            "status": API_UNAUTHORIZED_STATUS,
+            "quota": true,
+        })
+    }
+
+    fn expected_auth_data() -> Value {
+        json!({
+            "message": TURN_ERROR,
+            "status": API_UNAUTHORIZED_STATUS,
+        })
+    }
+
+    #[test_case(
+        false,
+        ApiErrorInfo { status: API_RATE_LIMIT_STATUS, retry_after_secs: Some(API_RETRY_AFTER_SECS), quota: false },
+        AcpError::internal_error(),
+        expected_rate_limit_data
+        ; "rate_limit_with_retry_after"
+    )]
+    #[test_case(
+        false,
+        ApiErrorInfo { status: API_UNAVAILABLE_STATUS, retry_after_secs: None, quota: false },
+        AcpError::internal_error(),
+        expected_unavailable_data
+        ; "server_error_without_retry_after"
+    )]
+    #[test_case(
+        false,
+        ApiErrorInfo { status: API_UNAUTHORIZED_STATUS, retry_after_secs: None, quota: true },
+        AcpError::internal_error(),
+        expected_quota_data
+        ; "quota_401"
+    )]
+    #[test_case(
+        true,
+        ApiErrorInfo { status: API_UNAUTHORIZED_STATUS, retry_after_secs: None, quota: false },
+        AcpError::auth_required(),
+        expected_auth_data
+        ; "auth_401"
+    )]
+    #[tokio::test]
+    async fn a_failed_api_turn_answers_the_prompt_with_structured_error_data(
+        auth: bool,
+        api: ApiErrorInfo,
+        expected_error: AcpError,
+        expected_data: fn() -> Value,
+    ) {
+        let (srv, .., mut out_rx) = test_server();
+        pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
+        run_pump(&srv, None, |sender| {
+            sender
+                .send(AgentEvent::Error {
+                    message: TURN_ERROR.to_owned(),
+                    auth,
+                    api: Some(api),
+                    totals: RunTotals::default(),
+                })
+                .unwrap();
+        })
+        .await;
+
+        let answer = out_rx.try_recv().expect("the pending prompt is answered");
+        assert_eq!(answer["id"], PROMPT_ID);
+        assert_eq!(answer["error"]["code"], i32::from(expected_error.code));
+        assert_eq!(answer["error"]["data"], expected_data());
+    }
+
     /// A cached input holds the whole file a `write` is about to lay down, and
     /// this pump lives as long as the session does, so a turn that died on a
     /// provider error has to let go of it just like a turn that finished.
     #[test_case(None, true ; "a_live_turn_shows_the_file_its_tool_call_named")]
     #[test_case(Some(done_event()), false ; "a_finished_turn_releases_its_tool_inputs")]
-    #[test_case(Some(AgentEvent::Error { message: TURN_ERROR.to_owned(), auth: false, totals: RunTotals::default() }), false ; "a_failed_turn_releases_its_tool_inputs")]
+    #[test_case(Some(AgentEvent::Error { message: TURN_ERROR.to_owned(), auth: false, api: None, totals: RunTotals::default() }), false ; "a_failed_turn_releases_its_tool_inputs")]
     #[tokio::test]
     async fn a_terminal_event_releases_the_turns_tool_inputs(
         terminal: Option<AgentEvent>,
@@ -2810,6 +2918,7 @@ mod tests {
             AgentEvent::Error {
                 message: TURN_ERROR.to_owned(),
                 auth: false,
+                api: None,
                 totals: ledger,
             }
         } else {

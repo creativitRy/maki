@@ -1783,7 +1783,7 @@ mod tests {
         assert_eq!(chat.last_message_role(), Some(&DisplayRole::Assistant));
     }
 
-    #[test_case(AgentEvent::Error { message: COMPACTION_ERROR.into(), auth: false, totals: RunTotals::default() } ; "error")]
+    #[test_case(AgentEvent::Error { message: COMPACTION_ERROR.into(), auth: false, api: None, totals: RunTotals::default() } ; "error")]
     #[test_case(AgentEvent::Done { usage: Default::default(), cost: None, list_cost: None, context_size: 0, context_window: 0, num_turns: 0, reason: DoneReason::Cancelled } ; "cancelled")]
     fn interrupted_compaction_has_no_success_notice(ending: AgentEvent) {
         let mut chat = chat();
@@ -1931,6 +1931,7 @@ mod tests {
         sub.track_run(&AgentEvent::Error {
             message: ERROR_TEXT.into(),
             auth: false,
+            api: None,
             totals: RunTotals::default(),
         });
         assert_eq!(sub.task_status(), TaskStatus::Idle);

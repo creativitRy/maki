@@ -660,6 +660,7 @@ mod tests {
         let error = AgentEvent::Error {
             message: ERROR_MESSAGE.into(),
             auth: false,
+            api: None,
             totals: RunTotals::default(),
         };
         assert!(!totals.fold(&error, None));

@@ -322,6 +322,7 @@ mod tests {
         snapshot.observe(&envelope(AgentEvent::Error {
             message: String::new(),
             auth: false,
+            api: None,
             totals: RunTotals {
                 usage: TokenUsage {
                     input: u64::from(SECOND_TURN_INPUT),

@@ -1696,6 +1696,7 @@ fn cancelled_run() -> AgentEvent {
     AgentEvent::Error {
         message: CANCELLED_MSG.to_owned(),
         auth: false,
+        api: None,
         totals: RunTotals::default(),
     }
 }
@@ -3011,6 +3012,7 @@ mod tests {
             AgentEvent::Error {
                 message: IGNORED_ERROR.into(),
                 auth: false,
+                api: None,
                 totals: RunTotals::default(),
             },
             AgentEvent::Done {
@@ -3351,7 +3353,7 @@ mod tests {
         assert!(
             matches!(
                 events.as_slice(),
-                [AgentEvent::Error { message, auth: false, totals }, AgentEvent::StreamClosed]
+                [AgentEvent::Error { message, auth: false, totals, .. }, AgentEvent::StreamClosed]
                     if message == CANCELLED_MSG && totals.usage == DONE_USAGE
             ),
             "{:?}",

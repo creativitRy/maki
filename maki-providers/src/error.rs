@@ -320,6 +320,13 @@ impl AgentError {
             && !self.is_thinking_unbound()
     }
 
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Self::Api { status, .. } if *status > 0 => Some(*status),
+            _ => None,
+        }
+    }
+
     pub fn is_auth_error(&self) -> bool {
         matches!(self, Self::Api { status: 401, .. }) && self.non_login_error().is_none()
     }
@@ -338,7 +345,7 @@ impl AgentError {
 
     /// A plan quota that resets on a weekly or monthly boundary: retrying just
     /// reprints the same message until the user cancels.
-    fn is_quota_exhausted(&self) -> bool {
+    pub fn is_quota_exhausted(&self) -> bool {
         self.non_login_error().is_some_and(|error| error.is_quota)
     }
 

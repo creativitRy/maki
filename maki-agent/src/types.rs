@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::fmt::Write;
-use std::ops::AddAssign;
+use std::ops::{AddAssign, Not};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -777,6 +777,8 @@ pub enum AgentEvent {
         message: String,
         /// The provider rejected the credentials, so a re-login is what fixes it.
         auth: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api: Option<ApiErrorInfo>,
         /// What the run spent before it failed, the same bill a `Done` carries,
         /// so a frontend settles either ending alike. Empty when no run started.
         #[serde(flatten)]
@@ -859,11 +861,28 @@ pub enum AgentEvent {
     StreamClosed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiErrorInfo {
+    pub status: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Not::not")]
+    pub quota: bool,
+}
+
 impl AgentEvent {
     pub fn error(error: &AgentError, totals: RunTotals) -> Self {
+        let api = error.status().map(|status| ApiErrorInfo {
+            status,
+            retry_after_secs: error
+                .retry_after()
+                .map(|delay| delay.as_secs() + u64::from(delay.subsec_nanos() > 0)),
+            quota: error.is_quota_exhausted(),
+        });
         Self::Error {
             message: error.user_message(),
             auth: error.is_auth_error(),
+            api,
             totals,
         }
     }
@@ -1491,6 +1510,19 @@ mod tests {
 
     use futures::FutureExt;
     use test_case::test_case;
+
+    const RATE_LIMIT_STATUS: u16 = 429;
+    const UNAVAILABLE_STATUS: u16 = 503;
+    const OVERLOADED_STATUS: u16 = 529;
+    const UNAUTHORIZED_STATUS: u16 = 401;
+    const RETRY_AFTER_SECS: u64 = 30;
+    const SUBSECOND_RETRY_AFTER_MS: u64 = 500;
+    const OPENCODE_GO_QUOTA_BODY: &str =
+        r#"{"error":{"type":"GoUsageLimitError","message":"Weekly usage limit reached."}}"#;
+    const RATE_LIMIT_BODY: &str = "slow down";
+    const UNAVAILABLE_BODY: &str = "unavailable";
+    const OVERLOADED_BODY: &str = "overloaded";
+    const STORAGE_ERROR_BODY: &str = "storage";
 
     #[test_case(ToolOutput::Plain("ok".into()),                      Some("1 line")      ; "plain_short_annotates")]
     #[test_case(ToolOutput::Plain((0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n").into()), Some("20 lines") ; "plain_long_annotates")]
@@ -2228,6 +2260,97 @@ mod tests {
         assert!(matches!(
             retained.send(AgentEvent::Nudge),
             Err(AgentError::Channel)
+        ));
+    }
+
+    fn rate_limit_with_retry_after() -> AgentError {
+        AgentError::Api {
+            status: RATE_LIMIT_STATUS,
+            message: RATE_LIMIT_BODY.into(),
+            retry_after: Some(Duration::from_secs(RETRY_AFTER_SECS)),
+        }
+    }
+
+    fn subsecond_rate_limit() -> AgentError {
+        AgentError::Api {
+            status: RATE_LIMIT_STATUS,
+            message: RATE_LIMIT_BODY.into(),
+            retry_after: Some(Duration::from_millis(SUBSECOND_RETRY_AFTER_MS)),
+        }
+    }
+
+    fn zero_status_storage_error() -> AgentError {
+        AgentError::api(0, STORAGE_ERROR_BODY)
+    }
+
+    fn rate_limit_without_retry_after() -> AgentError {
+        AgentError::api(RATE_LIMIT_STATUS, RATE_LIMIT_BODY)
+    }
+
+    fn service_unavailable() -> AgentError {
+        AgentError::api(UNAVAILABLE_STATUS, UNAVAILABLE_BODY)
+    }
+
+    fn overloaded() -> AgentError {
+        AgentError::api(OVERLOADED_STATUS, OVERLOADED_BODY)
+    }
+
+    fn opencode_quota_401() -> AgentError {
+        AgentError::api(UNAUTHORIZED_STATUS, OPENCODE_GO_QUOTA_BODY)
+    }
+
+    fn channel_error() -> AgentError {
+        AgentError::Channel
+    }
+
+    #[test_case(
+        rate_limit_with_retry_after,
+        false,
+        Some(ApiErrorInfo { status: RATE_LIMIT_STATUS, retry_after_secs: Some(RETRY_AFTER_SECS), quota: false })
+        ; "rate_limit_with_retry_after"
+    )]
+    #[test_case(
+        rate_limit_without_retry_after,
+        false,
+        Some(ApiErrorInfo { status: RATE_LIMIT_STATUS, retry_after_secs: None, quota: false })
+        ; "rate_limit_without_retry_after"
+    )]
+    #[test_case(
+        service_unavailable,
+        false,
+        Some(ApiErrorInfo { status: UNAVAILABLE_STATUS, retry_after_secs: None, quota: false })
+        ; "server_error_503"
+    )]
+    #[test_case(
+        overloaded,
+        false,
+        Some(ApiErrorInfo { status: OVERLOADED_STATUS, retry_after_secs: None, quota: false })
+        ; "overloaded_529"
+    )]
+    #[test_case(
+        opencode_quota_401,
+        false,
+        Some(ApiErrorInfo { status: UNAUTHORIZED_STATUS, retry_after_secs: None, quota: true })
+        ; "opencode_quota_401"
+    )]
+    #[test_case(
+        subsecond_rate_limit,
+        false,
+        Some(ApiErrorInfo { status: RATE_LIMIT_STATUS, retry_after_secs: Some(1), quota: false })
+        ; "subsecond_retry_after_rounds_up"
+    )]
+    #[test_case(zero_status_storage_error, false, None ; "zero_status_storage_error")]
+    #[test_case(channel_error, false, None ; "non_api_error")]
+    fn agent_event_error_populates_api_metadata(
+        make_error: fn() -> AgentError,
+        expected_auth: bool,
+        expected_api: Option<ApiErrorInfo>,
+    ) {
+        let error = make_error();
+        let event = AgentEvent::error(&error, RunTotals::default());
+        assert!(matches!(
+            event,
+            AgentEvent::Error { auth, api, .. } if auth == expected_auth && api == expected_api
         ));
     }
 }
