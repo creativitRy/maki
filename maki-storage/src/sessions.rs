@@ -457,6 +457,9 @@ pub struct HistorySnapshot<M> {
     /// this instead of the context a layer wrapped around it. In memory only:
     /// the title it produced is what gets saved.
     pub title_source: Option<Arc<str>>,
+    /// Whether a message-dropping transition from this snapshot should archive
+    /// the replaced log (`true` for compaction, `false` for Turn-0 error rollback).
+    pub archive_drop: bool,
 }
 
 /// The `tools` array the messages went out with, so a reader sending its own
@@ -476,6 +479,7 @@ impl<M> HistorySnapshot<M> {
             frame: None,
             tools: None,
             title_source: None,
+            archive_drop: true,
         }
     }
 }
@@ -546,6 +550,10 @@ pub struct Session<M, U, T> {
     /// never serialized: a loaded session has dropped nothing.
     #[serde(skip)]
     sealed_by: SealedBy,
+    /// Suppresses archiving when the latest snapshot is a Turn-0 rollback
+    /// undoing an unanswered turn rather than a compaction or rewind.
+    #[serde(skip)]
+    suppress_archive: bool,
 }
 
 #[derive(Serialize)]
@@ -1183,7 +1191,9 @@ impl SessionLog {
         tmp_file.sync_data().map_err(StorageError::from)?;
         // Last thing before the rename: only a write that lands may archive
         // the log it replaces.
-        archive_if_dropping(dir, session);
+        if !session.suppress_archive {
+            archive_if_dropping(dir, session);
+        }
         fs::rename(&tmp, &path).map_err(StorageError::from)?;
         crate::sync_parent_dir(&path);
 
@@ -1609,6 +1619,7 @@ where
         epoch: next_epoch(),
         rewrites: 0,
         sealed_by: SealedBy::Unknown,
+        suppress_archive: false,
     })
 }
 
@@ -1978,6 +1989,7 @@ where
             epoch: next_epoch(),
             rewrites: 0,
             sealed_by: SealedBy::Unknown,
+            suppress_archive: false,
         }
     }
 
@@ -2109,6 +2121,7 @@ where
         if drops_messages(&self.messages, &messages) {
             self.sealed_by = SealedBy::Compaction;
         }
+        self.suppress_archive = false;
         self.messages = Arc::new(messages);
         self.rewrite_messages();
     }
@@ -2119,6 +2132,7 @@ where
         }
         Arc::make_mut(&mut self.messages).truncate(len);
         self.sealed_by = SealedBy::Rewind;
+        self.suppress_archive = false;
         self.rewrite_messages();
     }
 
@@ -2131,7 +2145,14 @@ where
         // Only compaction drops turns from a producer's history. A snapshot
         // from the same run is an append, so it skips the compare.
         if snapshot.epoch != self.epoch && drops_messages(&self.messages, &snapshot.messages) {
-            self.sealed_by = SealedBy::Compaction;
+            if snapshot.archive_drop {
+                self.sealed_by = SealedBy::Compaction;
+                self.suppress_archive = false;
+            } else {
+                self.suppress_archive = true;
+            }
+        } else {
+            self.suppress_archive = false;
         }
         self.messages = Arc::clone(&snapshot.messages);
         self.frame = snapshot.frame.clone();
@@ -2674,6 +2695,8 @@ mod tests {
     const LATE_MCP_TOOLS: [&str; 3] = ["github__search", "linear__issue", "sentry__events"];
     const TYPED_PROMPT: &str = "fix the login bug";
     const REWRITTEN_PROMPT: &str = "memories: the login uses OAuth. fix the login bug";
+    const ROLLBACK_NO_ARCHIVE: &str = "a Turn-0 rollback snapshot must not create an archive";
+    const COMPACTION_ARCHIVES: &str = "compaction after a rollback must still archive";
 
     impl TitleSource for Value {
         fn first_user_text(&self) -> Option<&str> {
@@ -3205,6 +3228,7 @@ mod tests {
             frame: None,
             tools: None,
             title_source: None,
+            archive_drop: true,
         };
         let meta = session.meta.clone();
         Session::checkpoint(
@@ -3232,6 +3256,7 @@ mod tests {
             frame: None,
             tools: None,
             title_source: None,
+            archive_drop: true,
         };
         Session::checkpoint(
             &mut session,
@@ -5202,5 +5227,71 @@ mod tests {
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
         assert_same_session(&loaded, &session);
+    }
+
+    #[test]
+    fn rollback_snapshot_rewrites_log_without_archiving() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
+        let meta = session.meta.clone();
+        let initial = HistorySnapshot::new(vec![
+            user_message("a"),
+            assistant_message("b"),
+            user_message("c"),
+        ]);
+        Session::checkpoint(
+            &mut session,
+            Some(&initial),
+            meta.clone(),
+            Value::Null,
+            no_tool_ids,
+        );
+        drop(SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap());
+
+        let rollback = HistorySnapshot {
+            epoch: next_epoch(),
+            messages: Arc::new(vec![user_message("a"), assistant_message("b")]),
+            frame: None,
+            tools: None,
+            title_source: None,
+            archive_drop: false,
+        };
+        Session::checkpoint(
+            &mut session,
+            Some(&rollback),
+            meta.clone(),
+            Value::Null,
+            no_tool_ids,
+        );
+        drop(SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap());
+
+        assert!(
+            TestSession::archive_windows_in(session.id, dir).is_empty(),
+            "{ROLLBACK_NO_ARCHIVE}"
+        );
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.messages().len(), 2);
+
+        let compaction = HistorySnapshot {
+            epoch: next_epoch(),
+            messages: Arc::new(vec![assistant_message("summary")]),
+            frame: None,
+            tools: None,
+            title_source: None,
+            archive_drop: true,
+        };
+        Session::checkpoint(
+            &mut session,
+            Some(&compaction),
+            meta,
+            Value::Null,
+            no_tool_ids,
+        );
+        drop(SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap());
+
+        let windows = TestSession::archive_windows_in(session.id, dir);
+        assert_eq!(windows.len(), 1, "{COMPACTION_ARCHIVES}");
+        assert_eq!(windows[0].sealed_by, SealedBy::Compaction);
     }
 }

@@ -493,8 +493,8 @@ fn mailbox_wake_starts_without_an_empty_user_bubble() {
         &actions[..],
         [Action::SendMessage(input)]
             if input.message.is_empty()
-                && input.preamble.len() == 1
-                && input.preamble[0].is_observation()
+                && input.woken_notices.len() == 1
+                && input.woken_notices[0].is_observation()
     ));
     assert_eq!(app.status, Status::Streaming);
     assert!(app.main_chat().segment_search_texts().is_empty());

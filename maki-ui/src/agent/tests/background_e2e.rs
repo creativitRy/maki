@@ -382,15 +382,16 @@ impl World {
         self.handles.mailbox().claim_wake()
     }
 
-    fn start_wake_run(&self, run_id: u64, preamble: Vec<Message>) {
-        assert!(!preamble.is_empty(), "{NO_WAKE}");
+    fn start_wake_run(&self, run_id: u64, woken_notices: Vec<Message>) {
+        assert!(!woken_notices.is_empty(), "{NO_WAKE}");
         self.handles.queue.push(QueueItem::Message(QueuedInput {
             text: String::new(),
             input: AgentInput {
                 message: String::new(),
                 mode: AgentMode::default(),
                 images: Vec::new(),
-                preamble,
+                preamble: Vec::new(),
+                woken_notices,
                 earlier: Vec::new(),
                 thinking: ThinkingConfig::default(),
                 fast: false,

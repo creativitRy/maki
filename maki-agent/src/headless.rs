@@ -201,7 +201,7 @@ impl KeepAlive {
             }
             AfterInput::Wake(input) => input,
         };
-        input.preamble = self.wake().await?;
+        input.woken_notices = self.wake().await?;
         Some(input)
     }
 }
@@ -276,6 +276,7 @@ fn woken_input(like: &AgentInput) -> AgentInput {
         mode: like.mode.clone(),
         images: Vec::new(),
         preamble: Vec::new(),
+        woken_notices: Vec::new(),
         earlier: Vec::new(),
         thinking: like.thinking,
         fast: like.fast,
@@ -711,11 +712,16 @@ pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle,
                     let result = match preamble {
                         Ok(preamble) => {
                             input.preamble.extend(preamble);
-                            agent.run(input).await
+                            let res = agent.run(input).await;
+                            drop(agent);
+                            res
                         }
-                        Err(e) => Err(e),
+                        Err(e) => {
+                            drop(agent);
+                            turn.revert();
+                            Err(e)
+                        }
                     };
-                    drop(agent);
                     if result.is_err() {
                         inputs.keep_alive.fail();
                     }
@@ -1670,8 +1676,11 @@ mod tests {
         let woken = inputs.next().await.expect(WAKES_AFTER_INPUT_END);
         assert!(woken.survives_failed_switch(), "{WOKEN_NOTICES_KEPT}");
         let woken = woken.into_input();
-        assert_eq!(woken.preamble.len(), 1);
-        assert_eq!(woken.preamble[0].first_text_content(), Some(NOTICE_BODY));
+        assert_eq!(woken.woken_notices.len(), 1);
+        assert_eq!(
+            woken.woken_notices[0].first_text_content(),
+            Some(NOTICE_BODY)
+        );
     }
 
     /// The host switched to plan mode after its last prompt, then ended its
@@ -1777,8 +1786,11 @@ mod tests {
 
         assert!(woken.message.is_empty());
         assert_eq!(woken.mode, plan_mode());
-        assert_eq!(woken.preamble.len(), 1);
-        assert_eq!(woken.preamble[0].first_text_content(), Some(NOTICE_BODY));
+        assert_eq!(woken.woken_notices.len(), 1);
+        assert_eq!(
+            woken.woken_notices[0].first_text_content(),
+            Some(NOTICE_BODY)
+        );
 
         keep_alive.follow(&woken);
         assert!(keep_alive.next_input().await.is_none(), "{ENDS_WHEN_IDLE}");

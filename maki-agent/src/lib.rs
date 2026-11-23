@@ -137,6 +137,7 @@ pub struct EarlierInput {
     pub message: String,
     pub images: Vec<ImageSource>,
     pub preamble: Vec<Message>,
+    pub woken_notices: Vec<Message>,
 }
 
 impl From<AgentInput> for EarlierInput {
@@ -145,6 +146,7 @@ impl From<AgentInput> for EarlierInput {
             message: input.message,
             images: input.images,
             preamble: input.preamble,
+            woken_notices: input.woken_notices,
         }
     }
 }
@@ -154,6 +156,8 @@ pub struct AgentInput {
     pub mode: AgentMode,
     pub images: Vec<ImageSource>,
     pub preamble: Vec<Message>,
+    /// Notices claimed from `SessionMailbox` to wake this turn, restored if Turn-0 fails.
+    pub woken_notices: Vec<Message>,
     /// The rest of a burst of queued messages, oldest first.
     pub earlier: Vec<EarlierInput>,
     pub thinking: ThinkingConfig,
@@ -180,6 +184,7 @@ impl AgentInput {
             mode,
             images,
             preamble: Vec::new(),
+            woken_notices: Vec::new(),
             earlier: Vec::new(),
             thinking: defaults.thinking.into(),
             fast: defaults.fast,

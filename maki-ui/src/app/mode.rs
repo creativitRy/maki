@@ -153,6 +153,7 @@ impl App {
             mode: self.agent_mode(),
             images: msg.images.clone(),
             preamble: Vec::new(),
+            woken_notices: Vec::new(),
             earlier: Vec::new(),
             thinking,
             fast,

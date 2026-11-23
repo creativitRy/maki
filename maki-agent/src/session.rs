@@ -1,5 +1,6 @@
 //! The one vocabulary every driver uses to talk about a persisted session.
 
+use std::mem;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -8,7 +9,7 @@ use maki_storage::StateDir;
 use maki_storage::frame::StoredFrame;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::{
-    SAVE_FAILED, Session, SessionClaim, SessionError, StoredMode, StoredThinking,
+    SAVE_FAILED, Session, SessionClaim, SessionError, SessionMeta, StoredMode, StoredThinking,
 };
 use thiserror::Error;
 use tracing::warn;
@@ -228,6 +229,8 @@ impl SessionTrack {
     /// reported yet. Moved work sends no events a frontend sees, so this
     /// turn's `Done` is where that spend shows up.
     pub fn turn(&mut self, model_spec: String, input: &AgentInput) -> SessionTurn<'_> {
+        let prev_model = self.store.session.model.clone();
+        let prev_meta = self.store.session.meta.clone();
         let meta = &mut self.store.session.meta;
         meta.mode = Some(match input.mode {
             AgentMode::Build => StoredMode::Build,
@@ -236,12 +239,23 @@ impl SessionTrack {
         meta.thinking = Some(input.thinking.into());
         meta.fast = input.fast;
         meta.workflow = input.workflow;
-        self.turn_as_before(model_spec)
+        self.start_turn(model_spec, prev_model, prev_meta)
     }
 
     /// A [`Self::turn`] with no input, like a `/compact`, so the settings
     /// stay what the last turn ran under.
     pub fn turn_as_before(&mut self, model_spec: String) -> SessionTurn<'_> {
+        let prev_model = self.store.session.model.clone();
+        let prev_meta = self.store.session.meta.clone();
+        self.start_turn(model_spec, prev_model, prev_meta)
+    }
+
+    fn start_turn(
+        &mut self,
+        model_spec: String,
+        prev_model: String,
+        prev_meta: SessionMeta,
+    ) -> SessionTurn<'_> {
         let unreported = self.spend.totals().since(&self.reported);
         let ledger = RunLedger::carrying(&self.spend, unreported);
         self.store.session.set_model(model_spec);
@@ -249,6 +263,9 @@ impl SessionTrack {
         SessionTurn {
             track: self,
             ledger,
+            prev_model,
+            prev_meta,
+            reverted: false,
         }
     }
 
@@ -289,6 +306,9 @@ impl Drop for SessionTrack {
 pub struct SessionTurn<'a> {
     track: &'a mut SessionTrack,
     ledger: Arc<RunLedger>,
+    prev_model: String,
+    prev_meta: SessionMeta,
+    reverted: bool,
 }
 
 impl SessionTurn<'_> {
@@ -302,6 +322,10 @@ impl SessionTurn<'_> {
     /// turn with no input of its own keeps the frame that prompt had.
     pub fn workflow(&self) -> bool {
         self.track.store.session.meta.workflow
+    }
+
+    pub fn revert(&mut self) {
+        self.reverted = true;
     }
 
     pub fn run_params(
@@ -320,6 +344,15 @@ impl SessionTurn<'_> {
 
 impl Drop for SessionTurn<'_> {
     fn drop(&mut self) {
+        if self.reverted || self.track.history.take_rolled_back() {
+            if self.track.store.session.model != self.prev_model {
+                self.track
+                    .store
+                    .session
+                    .set_model(mem::take(&mut self.prev_model));
+            }
+            self.track.store.session.meta = mem::take(&mut self.prev_meta);
+        }
         self.track.reported += self.ledger.totals();
         self.track.settle();
         self.track.store.publish_header(false);
@@ -413,21 +446,30 @@ impl SessionStore {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::fs;
     use std::path::PathBuf;
+    use std::sync::Mutex;
 
-    use maki_providers::{ContentBlock, Role};
+    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::{
+        AgentError, ContentBlock, Model, ProviderEvent, RequestOptions, Role, StopReason,
+        StreamResponse,
+    };
     use maki_storage::frame::PromptFacts;
     use maki_storage::id::MakiId;
     use maki_storage::sessions::{SESSIONS_DIR, generate_title};
+    use serde_json::{Value, json};
     use tempfile::TempDir;
     use test_case::test_case;
-    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+    use crate::agent::RunContext;
+    use crate::agent::testing::{agent_params, sync_builder};
     use crate::tools::RequestTools;
-    use crate::{BackgroundNotice, InputSource, RunContext, SessionDefaults, TaskEnd};
+    use crate::{Agent, BackgroundNotice, Envelope, InputSource, SessionDefaults, TaskEnd};
 
     use super::*;
-    use crate::agent::testing::sync_builder;
     use crate::agent::{live_header, live_history};
 
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
@@ -469,6 +511,16 @@ mod tests {
     const LATE_REPORTED_ONCE: &str = "late spend already reported must not be billed twice";
     const LATE_STORED: &str =
         "what moved work spent after the last turn must count once, with no turn to carry it";
+    const RATE_LIMIT_STATUS: u16 = 429;
+    const RATE_LIMIT_MSG: &str = "rate limited";
+    const REBUILT_FRAME_SYSTEM: &str = "updated system forcing frame rebuild";
+    const THOUGHT_TEXT: &str = "thinking";
+    const THOUGHT_SIG: &str = "sig";
+    const ASSISTANT_REPLY: &str = "initial reply";
+    const TOOL_CALL_ID: &str = "call_1";
+    const UNKNOWN_TOOL_NAME: &str = "nonexistent_tool";
+    const FAILED_TURN_SETTINGS_RESTORED: &str =
+        "a Turn-0 failure must restore model and meta even when background spend triggers a write";
 
     fn session_id() -> MakiId {
         SESSION_ID.parse().unwrap()
@@ -1126,5 +1178,292 @@ mod tests {
             [BACKGROUND_TASK_ID],
             "{UNSETTLED_STORED}"
         );
+    }
+
+    struct ScriptedStreamProvider {
+        outcomes: Mutex<VecDeque<Result<StreamResponse, AgentError>>>,
+    }
+
+    impl ScriptedStreamProvider {
+        fn new(
+            outcomes: impl IntoIterator<Item = Result<StreamResponse, AgentError>>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                outcomes: Mutex::new(outcomes.into_iter().collect()),
+            })
+        }
+    }
+
+    impl Provider for ScriptedStreamProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a UnboundedSender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                self.outcomes
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("scripted provider outcome missing")
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    fn test_model() -> Model {
+        Model::from_spec(MODEL_SPEC).unwrap()
+    }
+
+    fn no_retry_agent<'a>(
+        provider: Arc<dyn Provider>,
+        turn: &'a mut SessionTurn<'_>,
+        system: &'static str,
+    ) -> (Agent<'a>, UnboundedReceiver<Envelope>) {
+        let mut params = agent_params(provider, test_model());
+        params.timeouts.retry.max_retries = 0;
+        let (raw_tx, event_rx) = unbounded_channel();
+        let run_params = turn.run_params(
+            EventSender::new(raw_tx, 0),
+            sync_builder(move |_, _| RunContext::fixed(system.into(), RequestTools::default())),
+        );
+        let agent = Agent::new(params, run_params);
+        (agent, event_rx)
+    }
+
+    fn rate_limit_error() -> Result<StreamResponse, AgentError> {
+        Err(AgentError::api(RATE_LIMIT_STATUS, RATE_LIMIT_MSG))
+    }
+
+    #[tokio::test]
+    async fn turn_zero_rate_limit_on_fresh_session_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let mut track = track_on(&tmp);
+        let provider = ScriptedStreamProvider::new([rate_limit_error()]);
+
+        let result = {
+            let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Build));
+            let (mut agent, _event_rx) = no_retry_agent(provider, &mut turn, FRAME_SYSTEM);
+            agent.run(input(AgentMode::Build)).await
+        };
+
+        assert!(matches!(
+            result,
+            Err(AgentError::Api {
+                status: RATE_LIMIT_STATUS,
+                ..
+            })
+        ));
+        assert!(track.history.is_empty());
+        assert!(!track.history.has_unsaved());
+        drop(track);
+        assert!(!log_path(&tmp).exists(), "{NO_EMPTY_FILE}");
+    }
+
+    #[tokio::test]
+    async fn turn_zero_rate_limit_on_saved_session_leaves_frame_and_file_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let frame = Arc::new(StoredFrame::new(
+            FRAME_SYSTEM.into(),
+            FRAME_FINGERPRINT.into(),
+            Some(PromptFacts {
+                cwd: CWD.into(),
+                ..Default::default()
+            }),
+            Vec::new(),
+        ));
+        let assistant_with_thinking = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: THOUGHT_TEXT.into(),
+                    signature: Some(THOUGHT_SIG.into()),
+                    reasoning_id: None,
+                },
+                ContentBlock::Text {
+                    text: ASSISTANT_REPLY.into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut initial = open_track(
+            Resumed {
+                history: vec![Message::user(PROMPT.into()), assistant_with_thinking],
+                frame: Some(Arc::clone(&frame)),
+                ..resumed()
+            },
+            claim(&tmp),
+            &tmp,
+        );
+        push_turn(&mut initial, MODEL_SPEC, |params| {
+            params.history.push(Message::user(OBSERVATION.into()));
+        });
+        drop(initial);
+        let before_bytes = fs::read(log_path(&tmp)).unwrap();
+
+        let mut track = open_track(
+            Resumed::stored(SessionRef::from(session_id()), load(&tmp)),
+            claim(&tmp),
+            &tmp,
+        );
+        let before_len = track.history.len();
+        let before_prefix = track
+            .history
+            .frame()
+            .and_then(|f| f.prefix())
+            .map(str::to_owned);
+        let provider = ScriptedStreamProvider::new([rate_limit_error()]);
+
+        let result = {
+            let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Build));
+            let (mut agent, _event_rx) = no_retry_agent(provider, &mut turn, REBUILT_FRAME_SYSTEM);
+            agent.run(input(AgentMode::Build)).await
+        };
+
+        assert!(matches!(
+            result,
+            Err(AgentError::Api {
+                status: RATE_LIMIT_STATUS,
+                ..
+            })
+        ));
+        assert_eq!(track.history.len(), before_len);
+        assert_eq!(
+            track.history.frame().and_then(|f| f.prefix()),
+            before_prefix.as_deref()
+        );
+        assert!(!track.history.has_unsaved());
+        assert!(
+            track.history.as_slice()[1]
+                .content
+                .iter()
+                .any(|block| matches!(
+                    block,
+                    ContentBlock::Thinking {
+                        signature: Some(_),
+                        ..
+                    }
+                ))
+        );
+        drop(track);
+        assert_eq!(
+            fs::read(log_path(&tmp)).unwrap(),
+            before_bytes,
+            "{UNTOUCHED}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tool_rate_limit_keeps_history_and_persists_to_disk() {
+        let tmp = TempDir::new().unwrap();
+        let mut track = track_on(&tmp);
+        let tool_turn = StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    TOOL_CALL_ID,
+                    UNKNOWN_TOOL_NAME,
+                    json!({}),
+                )],
+                ..Default::default()
+            },
+            usage: TokenUsage::default(),
+            stop_reason: Some(StopReason::ToolUse),
+            ..Default::default()
+        };
+        let provider = ScriptedStreamProvider::new([Ok(tool_turn), rate_limit_error()]);
+
+        let result = {
+            let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Build));
+            let (mut agent, _event_rx) = no_retry_agent(provider, &mut turn, FRAME_SYSTEM);
+            agent.run(input(AgentMode::Build)).await
+        };
+
+        assert!(matches!(
+            result,
+            Err(AgentError::Api {
+                status: RATE_LIMIT_STATUS,
+                ..
+            })
+        ));
+        assert_eq!(track.history.len(), 3);
+        drop(track);
+
+        assert!(log_path(&tmp).exists());
+        let loaded = load(&tmp);
+        assert_eq!(loaded.messages().len(), 3);
+        assert_eq!(loaded.messages()[0].user_text(), Some(PROMPT));
+        assert!(loaded.messages()[1].has_tool_calls());
+        assert!(
+            loaded.messages()[2]
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_zero_rate_limit_restores_model_and_meta_even_with_background_spend() {
+        let tmp = TempDir::new().unwrap();
+        let mut track = track_on(&tmp);
+        let initial_input = AgentInput::from_defaults(
+            PROMPT.into(),
+            AgentMode::Build,
+            Vec::new(),
+            SessionDefaults::default(),
+            InputSource::Headless,
+        );
+        {
+            let mut turn = track.turn(MODEL_SPEC.into(), &initial_input);
+            run_params(&mut turn)
+                .history
+                .push(Message::user(PROMPT.into()));
+        }
+
+        track
+            .spend
+            .add(tokens(LATE_INPUT_TOKENS), Some(LATE_COST), None);
+        let provider = ScriptedStreamProvider::new([rate_limit_error()]);
+        let failing_input = input(AgentMode::Plan(PLAN_PATH.into()));
+        let result = {
+            let mut turn = track.turn(OTHER_SPEC.into(), &failing_input);
+            let (mut agent, _event_rx) = no_retry_agent(provider, &mut turn, FRAME_SYSTEM);
+            agent.run(failing_input).await
+        };
+
+        assert!(matches!(
+            result,
+            Err(AgentError::Api {
+                status: RATE_LIMIT_STATUS,
+                ..
+            })
+        ));
+        let header = live_header(session_id()).unwrap();
+        assert_eq!(header.model, MODEL_SPEC, "{FAILED_TURN_SETTINGS_RESTORED}");
+        assert_eq!(
+            header.mode,
+            Some(StoredMode::Build),
+            "{FAILED_TURN_SETTINGS_RESTORED}"
+        );
+        assert!(!header.fast, "{FAILED_TURN_SETTINGS_RESTORED}");
+        assert!(!header.working);
+
+        let stored = load(&tmp);
+        assert_eq!(stored.model, MODEL_SPEC, "{FAILED_TURN_SETTINGS_RESTORED}");
+        assert_eq!(
+            stored.meta.mode,
+            Some(StoredMode::Build),
+            "{FAILED_TURN_SETTINGS_RESTORED}"
+        );
+        assert!(!stored.meta.fast, "{FAILED_TURN_SETTINGS_RESTORED}");
+        assert_eq!(stored.token_usage.input, LATE_INPUT_TOKENS);
     }
 }

@@ -321,6 +321,7 @@ pub(crate) mod testing {
             mode: AgentMode::Build,
             images: Vec::new(),
             preamble: Vec::new(),
+            woken_notices: Vec::new(),
             earlier: Vec::new(),
             thinking: ThinkingConfig::default(),
             fast: false,

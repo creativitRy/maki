@@ -178,6 +178,7 @@ impl App {
                 mode: AgentMode::Build,
                 images: msg.images,
                 preamble: Vec::new(),
+                woken_notices: Vec::new(),
                 earlier: Vec::new(),
                 thinking,
                 fast,
@@ -314,13 +315,13 @@ impl App {
 
     pub(super) fn start_mailbox_run(
         &mut self,
-        preamble: Vec<maki_providers::Message>,
+        woken_notices: Vec<maki_providers::Message>,
     ) -> Vec<Action> {
         let mut input = self.build_agent_input(&QueuedMessage {
             text: String::new(),
             images: Vec::new(),
         });
-        input.preamble = preamble;
+        input.woken_notices = woken_notices;
         self.start_run(input, String::new())
     }
 

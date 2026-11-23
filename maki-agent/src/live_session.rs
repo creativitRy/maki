@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::mem;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
@@ -156,8 +157,20 @@ impl Mailbox {
     }
 
     fn take(&mut self) -> Vec<Message> {
-        self.wake = false;
-        self.pending.drain(..).collect()
+        self.take_with_wake().0
+    }
+
+    fn take_with_wake(&mut self) -> (Vec<Message>, bool) {
+        let wake = mem::take(&mut self.wake);
+        let messages = self.pending.drain(..).collect();
+        (messages, wake)
+    }
+
+    fn restore_front(&mut self, messages: Vec<Message>, wake: bool) {
+        for message in messages.into_iter().rev() {
+            self.pending.push_front(message);
+        }
+        self.wake |= wake;
     }
 
     fn unsettled(&self) -> impl Iterator<Item = &String> {
@@ -479,7 +492,18 @@ impl SessionMailbox {
     }
 
     pub fn drain(&self) -> Vec<Message> {
-        lock(&self.live.mailbox).take()
+        self.drain_with_wake().0
+    }
+
+    pub(crate) fn drain_with_wake(&self) -> (Vec<Message>, bool) {
+        lock(&self.live.mailbox).take_with_wake()
+    }
+
+    pub(crate) fn restore_front(&self, messages: Vec<Message>, wake: bool) {
+        if messages.is_empty() && !wake {
+            return;
+        }
+        self.change(|mailbox| mailbox.restore_front(messages, wake));
     }
 
     pub fn claim_wake(&self) -> Vec<Message> {

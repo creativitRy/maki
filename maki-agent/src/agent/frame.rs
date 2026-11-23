@@ -201,6 +201,7 @@ pub(crate) fn fingerprint(context: &RunContext, mcp: Option<&McpSession>, model:
 
 /// The in-memory half of a frame. The first run of a process rebuilds it from
 /// the stored half.
+#[derive(Clone)]
 pub(crate) struct LiveFrame {
     /// Kept for its filter, which dispatch checks tool names against.
     pub(crate) tools: RequestTools,

@@ -23,7 +23,7 @@ use super::display_order::{observation_detail, observation_line};
 use super::frame::{
     FRAME_REBUILT, FrameFit, RunContextBuilder, context_update, fingerprint, fit_frame,
 };
-use super::history::{Cutter, History, sanitize_cancelled_history};
+use super::history::{Cutter, History, HistoryRollback, sanitize_cancelled_history};
 use super::hook::{AgentHooks, AgentSlot};
 use super::instructions::{CallInstructions, LoadedInstructions};
 use super::streaming::{StreamError, StreamRequest, min_output, stream_with_retry};
@@ -177,6 +177,10 @@ pub struct Agent<'h> {
     loaded_instructions: LoadedInstructions,
     instruction_files: Arc<Vec<String>>,
     rollback_len: usize,
+    rollback_history: Option<HistoryRollback>,
+    rollback_gauge: Option<ContextGauge>,
+    turn_zero_mailbox: (Vec<Message>, bool),
+    blamed_images_turn_zero: bool,
     carry_from: usize,
     /// A defer over input no turn has answered holds `carry_from` through the
     /// save turn.
@@ -236,6 +240,10 @@ impl<'h> Agent<'h> {
             loaded_instructions: LoadedInstructions::new(),
             instruction_files: Arc::default(),
             rollback_len: 0,
+            rollback_history: None,
+            rollback_gauge: None,
+            turn_zero_mailbox: (Vec::new(), false),
+            blamed_images_turn_zero: false,
             carry_from: 0,
             defer_pins: false,
             mcp: None,
@@ -319,6 +327,7 @@ impl<'h> Agent<'h> {
             mode,
             images,
             preamble,
+            woken_notices,
             earlier,
             thinking,
             fast,
@@ -329,37 +338,46 @@ impl<'h> Agent<'h> {
         self.begin(RequestOptions { thinking, fast });
         self.mode = mode;
         self.workflow = workflow;
-        // Each message of a burst is judged on its own, and one kept message is
-        // enough for the run to go on.
-        let burst = earlier
-            .into_iter()
-            .map(|e| (e.message, e.images, e.preamble))
-            .chain([(message, images, preamble)]);
-        let mut prompt = None;
-        for (message, images, preamble) in burst {
-            let kept = match self
-                .filter_user_message(&message, images.len(), source)
-                .await
-            {
-                Err(AgentError::Cancelled) => return self.finish(Err(AgentError::Cancelled)),
-                kept => kept?,
-            };
-            // A burst dropped whole or a run already cancelled sends nothing,
-            // so it must not rebuild the frame either. The next run sees the
-            // same change.
-            if kept.is_some() && prompt.is_none() && !self.cancel.is_cancelled() {
-                self.refresh_frame().await?;
-            }
-            let kept = kept.map(|text| {
-                self.history.offer_title_source(&message, &text);
-                prompt = Some(text.clone());
-                Message::user_with_images(text, images)
-            });
-            self.land_input(preamble, kept, true)?;
+        for woken in earlier
+            .iter()
+            .flat_map(|item| item.woken_notices.iter())
+            .chain(woken_notices.iter())
+        {
+            self.turn_zero_mailbox.0.push(woken.clone());
         }
-        let Some(message) = prompt else {
-            self.emit_done(DoneReason::Dropped)?;
-            return Ok(DoneReason::Dropped);
+        let landed: Result<Option<String>, AgentError> = async {
+            // Each message of a burst is judged on its own, and one kept message is
+            // enough for the run to go on.
+            let burst = earlier
+                .into_iter()
+                .map(|e| (e.message, e.images, e.preamble, e.woken_notices))
+                .chain([(message, images, preamble, woken_notices)]);
+            let mut prompt = None;
+            for (message, images, preamble, woken_notices) in burst {
+                let kept = self
+                    .filter_user_message(&message, images.len(), source)
+                    .await?;
+                // A burst dropped whole or a run already cancelled sends nothing,
+                // so it must not rebuild the frame either. The next run sees the
+                // same change.
+                if kept.is_some() && prompt.is_none() && !self.cancel.is_cancelled() {
+                    self.refresh_frame().await?;
+                }
+                let kept = kept.map(|text| {
+                    self.history.offer_title_source(&message, &text);
+                    prompt = Some(text.clone());
+                    Message::user_with_images(text, images)
+                });
+                self.land_input(preamble, woken_notices, kept, true)?;
+            }
+            Ok(prompt)
+        }
+        .await;
+        let Some(message) = (match landed {
+            Ok(prompt) => prompt,
+            Err(e) => return self.finish(Err(e)),
+        }) else {
+            return self.finish(Ok(DoneReason::Dropped));
         };
 
         info!(
@@ -393,8 +411,9 @@ impl<'h> Agent<'h> {
         opts: RequestOptions,
     ) -> Result<DoneReason, AgentError> {
         self.begin(opts);
+        self.turn_zero_mailbox.0.extend(notices.iter().cloned());
         let landed = async {
-            self.land_input(notices, None, false)?;
+            self.land_input(Vec::new(), notices, None, false)?;
             self.handle_queued_command().await
         }
         .await;
@@ -417,6 +436,11 @@ impl<'h> Agent<'h> {
     fn begin(&mut self, opts: RequestOptions) {
         self.rollback_len = self.history.len();
         self.carry_from = self.history.len();
+        self.rollback_history = Some(self.history.checkpoint());
+        self.rollback_gauge = Some(self.gauge.clone());
+        self.history.clear_rolled_back();
+        self.turn_zero_mailbox = (Vec::new(), false);
+        self.blamed_images_turn_zero = false;
         self.stop_continuations = 0;
         self.moved_last_round = false;
         self.opts = opts;
@@ -460,11 +484,33 @@ impl<'h> Agent<'h> {
                 sanitize_cancelled_history(self.history, self.rollback_len, cutter);
                 DoneReason::Cancelled
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                self.rollback_turn_zero();
+                return Err(e);
+            }
         };
         self.emit_done(reason)?;
 
         Ok(reason)
+    }
+
+    fn rollback_turn_zero(&mut self) {
+        if self.num_turns != 0 {
+            return;
+        }
+        if mem::take(&mut self.blamed_images_turn_zero) {
+            forgive_refused_images(&self.model, self.history.as_slice());
+        }
+        if let Some(checkpoint) = self.rollback_history.take() {
+            self.history.rollback(checkpoint);
+        }
+        if let Some(gauge) = self.rollback_gauge.take() {
+            *self.gauge = gauge;
+        }
+        let (messages, wake) = mem::take(&mut self.turn_zero_mailbox);
+        if let Some(mailbox) = &self.mailbox {
+            mailbox.restore_front(messages, wake);
+        }
     }
 
     /// The preamble lands even when the message was dropped. It holds what the
@@ -478,10 +524,11 @@ impl<'h> Agent<'h> {
     fn land_input(
         &mut self,
         preamble: Vec<Message>,
+        woken_notices: Vec<Message>,
         message: Option<Message>,
         drain_mailbox: bool,
     ) -> Result<(), AgentError> {
-        for message in preamble {
+        for message in preamble.into_iter().chain(woken_notices) {
             self.land_observation(message)?;
         }
         let Some(message) = message else {
@@ -501,7 +548,15 @@ impl<'h> Agent<'h> {
         let Some(mailbox) = &self.mailbox else {
             return Ok(());
         };
-        for message in mailbox.drain() {
+        let messages = if self.num_turns == 0 {
+            let (messages, wake) = mailbox.drain_with_wake();
+            self.turn_zero_mailbox.0.extend(messages.iter().cloned());
+            self.turn_zero_mailbox.1 |= wake;
+            messages
+        } else {
+            mailbox.drain()
+        };
+        for message in messages {
             self.land_observation(message)?;
         }
         Ok(())
@@ -746,6 +801,10 @@ impl<'h> Agent<'h> {
             }
         };
         self.num_turns += 1;
+        self.rollback_history = None;
+        self.rollback_gauge = None;
+        self.turn_zero_mailbox = (Vec::new(), false);
+        self.blamed_images_turn_zero = false;
         self.note_input_transformations(&response.input_transformations);
 
         let has_tools = response.message.has_tool_calls();
@@ -982,6 +1041,11 @@ impl<'h> Agent<'h> {
             error!(error = %err, model = %self.model.id, self.num_turns, "stream_message failed");
             return Err(err);
         }
+        if self.num_turns == 0
+            && let Some(checkpoint) = &mut self.rollback_history
+        {
+            checkpoint.strip_thinking();
+        }
         warn!(session = ?self.session_id, model = %self.model.id, dropped, error = %err, "thinking bound to a moved prefix, dropped it all");
         self.event_tx.send(AgentEvent::Notice {
             text: THINKING_DROPPED.into(),
@@ -1005,6 +1069,9 @@ impl<'h> Agent<'h> {
             let restored = forgive_refused_images(&self.model, self.history.as_slice());
             error!(error = %err, model = %self.model.id, self.num_turns, restored, "stream_message failed");
             return Err(err);
+        }
+        if self.num_turns == 0 {
+            self.blamed_images_turn_zero = true;
         }
         warn!(session = ?self.session_id, model = %self.model.id, withheld, error = %err, "server refused a request with images, retrying without them");
         self.event_tx.send(AgentEvent::Notice {
@@ -1280,9 +1347,11 @@ impl<'h> Agent<'h> {
         self.rollback_len = carry_from;
         self.carry_from = carry_from;
         self.defer_pins = false;
+        self.checkpoint_compacted_turn_zero(carry_from, carried);
         // The old prefix has nothing worth keeping now, so the new prompt picks
         // up every fact told since.
         self.refresh_frame().await?;
+        self.checkpoint_compacted_turn_zero(carry_from, carried);
         // An unanswered prompt says what to do next better than the generic
         // nudge, so it stands in for it. A layer's own words still go in.
         if let Some(text) = &steer.continue_text {
@@ -1311,6 +1380,21 @@ impl<'h> Agent<'h> {
         })
     }
 
+    fn checkpoint_compacted_turn_zero(&mut self, carry_from: usize, carried: usize) {
+        if self.num_turns != 0 {
+            return;
+        }
+        self.rollback_history = Some(self.history.checkpoint_prefix(carry_from));
+        let mut rollback_gauge = ContextGauge::default();
+        if let Some((system, tools)) = self.history.request_prefix() {
+            rollback_gauge.reset(&self.history.as_slice()[..carry_from], system, tools);
+        }
+        self.rollback_gauge = Some(rollback_gauge);
+        if carried == 0 {
+            self.turn_zero_mailbox = (Vec::new(), false);
+        }
+    }
+
     async fn handle_queued_command(&mut self) -> Result<bool, AgentError> {
         let Some(ref source) = self.interrupt_source else {
             return Ok(false);
@@ -1324,6 +1408,13 @@ impl<'h> Agent<'h> {
             // The burst lands as consecutive user messages, so one request
             // carries all of it.
             ExtractedCommand::Interrupt(inputs) => {
+                if self.num_turns == 0 {
+                    for input in &inputs {
+                        self.turn_zero_mailbox
+                            .0
+                            .extend(input.woken_notices.iter().cloned());
+                    }
+                }
                 let mut kept_any = false;
                 let last = inputs.len().saturating_sub(1);
                 for (index, input) in inputs.into_iter().enumerate() {
@@ -1347,7 +1438,7 @@ impl<'h> Agent<'h> {
                     }
                     // Each prompt is drawn as it is consumed, so a note
                     // drained earlier would show up between them.
-                    self.land_input(input.preamble, message, index == last)?;
+                    self.land_input(input.preamble, input.woken_notices, message, index == last)?;
                 }
                 Ok(kept_any)
             }
@@ -1508,6 +1599,19 @@ mod tests {
         "TurnComplete, Done, and the compaction trigger must read one context gauge";
     const NOTICE_BODY: &str = "Background task find auth finished:\n\nok";
     const NOTICE_LINE: &str = "Background agent finished: find auth";
+    const RATE_LIMIT_STATUS: u16 = 429;
+    const PAYLOAD_TOO_LARGE_STATUS: u16 = 413;
+    const BAD_REQUEST_STATUS: u16 = 400;
+    const RATE_LIMIT_MSG: &str = "rate limited";
+    const BAD_REQUEST_MSG: &str = "image rejected";
+    const PROMPT_TOO_LONG_MSG: &str = "prompt is too long";
+    const PRE_TURN_NOTICE: &str = "pre-turn notice";
+    const MID_REQUEST_NOTICE: &str = "mid-request notice";
+    const WOKEN_NOTICE: &str = "woken notice";
+    const CMD_PREAMBLE: &str = "shell preamble output";
+    const UNANSWERED_PROMPT: &str = "answer this after compacting";
+    const PRIOR_PROMPT: &str = "prior turn";
+    const IMAGE_FORGIVEN_MSG: &str = "a Turn-0 rate limit after image blame must forgive the image";
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -1774,6 +1878,7 @@ mod tests {
             mode: AgentMode::Build,
             images: Vec::new(),
             preamble: Vec::new(),
+            woken_notices: Vec::new(),
             earlier: Vec::new(),
             thinking: Default::default(),
             fast: false,
@@ -2141,13 +2246,14 @@ mod tests {
         match path {
             NoticePath::WakePreamble => {
                 input.message.clear();
-                input.preamble = mailbox.claim_wake();
+                input.woken_notices = mailbox.claim_wake();
             }
             NoticePath::WakeBatchedWithPrompt => {
                 input.earlier = vec![EarlierInput {
                     message: String::new(),
                     images: Vec::new(),
-                    preamble: mailbox.claim_wake(),
+                    preamble: Vec::new(),
+                    woken_notices: mailbox.claim_wake(),
                 }];
             }
             NoticePath::PromptPreamble => input.preamble = mailbox.drain(),
@@ -3424,6 +3530,7 @@ mod tests {
                 message: BLOCKED.into(),
                 images: Vec::new(),
                 preamble: vec![Message::observation(SHELL_RESULT.into())],
+                woken_notices: Vec::new(),
             }],
             ..default_input()
         };
@@ -4191,14 +4298,20 @@ mod tests {
             ..ImageRefusingProvider::refusing(BAD_PNG)
         };
         let (mut agent, mut event_rx) = make_agent(provider, &mut history);
+        let input = image_input(BAD_PNG);
+        let probe = [Message::user_with_images(
+            input.message.clone(),
+            input.images.clone(),
+        )];
 
-        let recovered = agent.run(image_input(BAD_PNG)).await.is_ok();
+        let recovered = agent.run(input).await.is_ok();
         drop(agent);
 
         assert_eq!(recovered, recovers);
-        assert!(
+        assert_eq!(
             carries_image(history.as_slice(), BAD_PNG),
-            "history keeps the pixels"
+            recovers,
+            "history keeps the pixels when the run succeeds and rolls back otherwise"
         );
         assert_eq!(
             has_event(&drain_events(&mut event_rx), |e| matches!(
@@ -4207,7 +4320,8 @@ mod tests {
             )),
             notices
         );
-        let next = adapt_images_for_model(&default_model(), history.as_slice()).await;
+        let slice = if recovers { history.as_slice() } else { &probe };
+        let next = adapt_images_for_model(&default_model(), slice).await;
         assert_eq!(
             carries_image(&next, BAD_PNG),
             !recovers,
@@ -4823,6 +4937,7 @@ mod tests {
                 message: first.into(),
                 images: Vec::new(),
                 preamble: vec![Message::observation(SHELL_RESULT.into())],
+                woken_notices: Vec::new(),
             }],
             ..default_input()
         };
@@ -5768,5 +5883,295 @@ mod tests {
 
         assert_eq!(reason, DoneReason::EndTurn);
         assert_continued(&drain_events(&mut event_rx), &history, allowed);
+    }
+
+    struct MailboxRateLimitProvider {
+        session_id: MakiId,
+        sent: AtomicBool,
+    }
+
+    impl Provider for MailboxRateLimitProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a UnboundedSender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                if !self.sent.swap(true, Ordering::SeqCst) {
+                    SessionMailbox::notify(self.session_id, MID_REQUEST_NOTICE.into(), None, false)
+                        .unwrap();
+                }
+                Err(AgentError::api(RATE_LIMIT_STATUS, RATE_LIMIT_MSG))
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    #[test_case(true ; "preserves_wake")]
+    #[test_case(false ; "stays_quiet")]
+    #[tokio::test]
+    async fn turn_zero_error_restores_mailbox_notices_ahead_of_mid_request_ones(wake: bool) {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::notify(id, PRE_TURN_NOTICE.into(), None, wake).unwrap();
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(
+            MailboxRateLimitProvider {
+                session_id: id,
+                sent: AtomicBool::new(false),
+            },
+            &mut history,
+        );
+        agent.mailbox = Some(mailbox.clone());
+        agent.timeouts.retry.max_retries = 0;
+
+        let result = agent.run(default_input()).await;
+        drop(agent);
+
+        assert!(matches!(
+            result,
+            Err(AgentError::Api {
+                status: RATE_LIMIT_STATUS,
+                ..
+            })
+        ));
+        assert!(history.is_empty());
+        assert!(!history.has_unsaved());
+
+        let woken = mailbox.claim_wake();
+        let queued = if wake {
+            assert!(!woken.is_empty());
+            woken
+        } else {
+            assert!(woken.is_empty());
+            mailbox.drain()
+        };
+        assert_eq!(queued.len(), 2);
+        let texts: Vec<_> = queued
+            .iter()
+            .map(|msg| serde_json::to_string(msg).unwrap())
+            .collect();
+        assert!(texts[0].contains(PRE_TURN_NOTICE));
+        assert!(texts[1].contains(MID_REQUEST_NOTICE));
+    }
+
+    struct ScriptedOutcomesProvider {
+        outcomes: Mutex<VecDeque<Result<StreamResponse, AgentError>>>,
+    }
+
+    impl Provider for ScriptedOutcomesProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a UnboundedSender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                self.outcomes
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("scripted outcome missing")
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_zero_compaction_survives_subsequent_rate_limit() {
+        let mut history = History::new(vec![
+            Message::user(PRIOR_PROMPT.into()),
+            text_response(StopReason::EndTurn).message,
+        ]);
+        fit_frame(&mut history, fixed_context(), None, &default_model());
+        history.mark_saved();
+        let mut gauge = ContextGauge::default();
+        let provider = ScriptedOutcomesProvider {
+            outcomes: Mutex::new(VecDeque::from([
+                Err(AgentError::api(
+                    PAYLOAD_TOO_LARGE_STATUS,
+                    PROMPT_TOO_LONG_MSG,
+                )),
+                Ok(summary_response()),
+                Err(AgentError::api(RATE_LIMIT_STATUS, RATE_LIMIT_MSG)),
+            ])),
+        };
+        let (mut agent, _event_rx) = make_agent_with_gauge(
+            Arc::new(provider),
+            default_model(),
+            &mut history,
+            &mut gauge,
+        );
+        agent.timeouts.retry.max_retries = 0;
+
+        let result = agent
+            .run(AgentInput {
+                message: UNANSWERED_PROMPT.into(),
+                ..default_input()
+            })
+            .await;
+        drop(agent);
+
+        assert!(matches!(
+            result,
+            Err(AgentError::Api {
+                status: RATE_LIMIT_STATUS,
+                ..
+            })
+        ));
+        assert!(history.has_unsaved());
+        assert!(
+            history
+                .as_slice()
+                .iter()
+                .any(|m| m.first_text_content() == Some(SUMMARY))
+        );
+        assert!(!history.as_slice().iter().any(|m| {
+            serde_json::to_string(m)
+                .unwrap()
+                .contains(UNANSWERED_PROMPT)
+        }));
+        let mut expected_gauge = ContextGauge::default();
+        let (system, tools) = history.request_prefix().unwrap();
+        expected_gauge.reset(history.as_slice(), system, tools);
+        assert_eq!(gauge.size(), expected_gauge.size());
+    }
+
+    #[tokio::test]
+    async fn turn_zero_error_in_resume_restores_woken_notices_without_rearming_wake() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::notify(id, WOKEN_NOTICE.into(), None, true).unwrap();
+        let notices = mailbox.claim_wake();
+        let mut history = History::new(vec![Message::user(PRIOR_PROMPT.into())]);
+        let (mut agent, _event_rx) = make_agent(
+            MailboxRateLimitProvider {
+                session_id: id,
+                sent: AtomicBool::new(false),
+            },
+            &mut history,
+        );
+        agent.mailbox = Some(mailbox.clone());
+        agent.timeouts.retry.max_retries = 0;
+
+        let result = agent.resume(notices, RequestOptions::default()).await;
+        drop(agent);
+
+        assert!(matches!(
+            result,
+            Err(AgentError::Api {
+                status: RATE_LIMIT_STATUS,
+                ..
+            })
+        ));
+        assert_eq!(history.len(), 1);
+        assert!(mailbox.claim_wake().is_empty());
+        let queued: Vec<_> = mailbox
+            .drain()
+            .into_iter()
+            .map(|msg| serde_json::to_string(&msg).unwrap())
+            .collect();
+        assert_eq!(queued.len(), 2);
+        assert!(queued[0].contains(WOKEN_NOTICE));
+        assert!(queued[1].contains(MID_REQUEST_NOTICE));
+    }
+
+    #[tokio::test]
+    async fn turn_zero_error_in_woken_run_restores_woken_notices_without_rearming_wake() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::notify(id, WOKEN_NOTICE.into(), None, true).unwrap();
+        let woken_notices = mailbox.claim_wake();
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(
+            MailboxRateLimitProvider {
+                session_id: id,
+                sent: AtomicBool::new(false),
+            },
+            &mut history,
+        );
+        agent.mailbox = Some(mailbox.clone());
+        agent.timeouts.retry.max_retries = 0;
+
+        let result = agent
+            .run(AgentInput {
+                message: String::new(),
+                preamble: vec![Message::observation(CMD_PREAMBLE.into())],
+                woken_notices,
+                ..default_input()
+            })
+            .await;
+        drop(agent);
+
+        assert!(matches!(
+            result,
+            Err(AgentError::Api {
+                status: RATE_LIMIT_STATUS,
+                ..
+            })
+        ));
+        assert!(history.is_empty());
+        assert!(!history.has_unsaved());
+        assert!(mailbox.claim_wake().is_empty());
+        let queued: Vec<_> = mailbox
+            .drain()
+            .into_iter()
+            .map(|msg| serde_json::to_string(&msg).unwrap())
+            .collect();
+        assert_eq!(queued.len(), 2);
+        assert!(queued[0].contains(WOKEN_NOTICE));
+        assert!(!queued[0].contains(CMD_PREAMBLE));
+        assert!(queued[1].contains(MID_REQUEST_NOTICE));
+    }
+
+    #[tokio::test]
+    async fn turn_zero_refused_image_then_rate_limit_forgives_image() {
+        let mut history = History::new(Vec::new());
+        fit_frame(&mut history, fixed_context(), None, &default_model());
+        history.mark_saved();
+        let provider = ScriptedOutcomesProvider {
+            outcomes: Mutex::new(VecDeque::from([
+                Err(AgentError::api(BAD_REQUEST_STATUS, BAD_REQUEST_MSG)),
+                Err(AgentError::api(RATE_LIMIT_STATUS, RATE_LIMIT_MSG)),
+            ])),
+        };
+        let (mut agent, _event_rx) =
+            make_agent_with(Arc::new(provider), default_model(), &mut history);
+        agent.timeouts.retry.max_retries = 0;
+        let input = image_input(BAD_PNG);
+        let probe = [Message::user_with_images(
+            input.message.clone(),
+            input.images.clone(),
+        )];
+
+        let result = agent.run(input).await;
+        drop(agent);
+
+        assert!(matches!(
+            result,
+            Err(AgentError::Api {
+                status: RATE_LIMIT_STATUS,
+                ..
+            })
+        ));
+        assert!(history.is_empty());
+        assert!(!history.has_unsaved());
+        let next = adapt_images_for_model(&default_model(), &probe).await;
+        assert!(carries_image(&next, BAD_PNG), "{IMAGE_FORGIVEN_MSG}");
     }
 }

@@ -1901,6 +1901,7 @@ pub(crate) fn plugin_input(message: String, opts: RequestOptions) -> AgentInput 
         mode: AgentMode::Build,
         images: Vec::new(),
         preamble: Vec::new(),
+        woken_notices: Vec::new(),
         earlier: Vec::new(),
         thinking: opts.thinking,
         fast: opts.fast,

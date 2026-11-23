@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::mem;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
@@ -126,6 +127,39 @@ pub fn live_header(session: MakiId) -> Option<Arc<SessionHeader>> {
     live_entries().get(&session)?.header()
 }
 
+pub(crate) struct HistoryRollback {
+    messages: Arc<Vec<Message>>,
+    unsaved: bool,
+    frame: Option<Arc<StoredFrame>>,
+    title_source: Option<Arc<str>>,
+    live: Option<LiveFrame>,
+    clean_turn: bool,
+}
+
+impl HistoryRollback {
+    pub(crate) fn strip_thinking(&mut self) {
+        let messages = Arc::make_mut(&mut self.messages);
+        strip_thinking(messages);
+        self.unsaved = true;
+    }
+}
+
+fn same_opt_arc<T: ?Sized>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+fn same_live_frame(a: Option<&LiveFrame>, b: Option<&LiveFrame>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.model == b.model && Arc::ptr_eq(&a.wire, &b.wire),
+        _ => false,
+    }
+}
+
 pub struct History {
     /// The value the mirror publishes, held whole so the two can never
     /// disagree and so a new run can never inherit the last one's epoch.
@@ -135,6 +169,9 @@ pub struct History {
     /// write is retried by the next turn instead of lost. [`Self::restored`]
     /// leaves it clear: its repair alone is not worth rewriting the file for.
     unsaved: bool,
+    /// Set by [`Self::rollback`] for an uncompacted Turn-0 failure so
+    /// `SessionTurn::drop` can revert the pending turn's model/meta.
+    rolled_back: bool,
     /// The in-memory half of `snapshot.frame`. It sits next to the transcript
     /// because messages only make sense under the prefix they were sent with,
     /// and every frontend already keeps a `History` for the whole session.
@@ -147,8 +184,57 @@ impl History {
             snapshot: HistorySnapshot::new(messages),
             mirror: None,
             unsaved: false,
+            rolled_back: false,
             live: None,
         }
+    }
+
+    pub(crate) fn checkpoint(&self) -> HistoryRollback {
+        HistoryRollback {
+            messages: Arc::clone(&self.snapshot.messages),
+            unsaved: self.unsaved,
+            frame: self.snapshot.frame.clone(),
+            title_source: self.snapshot.title_source.clone(),
+            live: self.live.clone(),
+            clean_turn: true,
+        }
+    }
+
+    pub(crate) fn checkpoint_prefix(&self, len: usize) -> HistoryRollback {
+        HistoryRollback {
+            messages: Arc::new(self.snapshot.messages[..len].to_vec()),
+            unsaved: true,
+            frame: self.snapshot.frame.clone(),
+            title_source: self.snapshot.title_source.clone(),
+            live: self.live.clone(),
+            clean_turn: false,
+        }
+    }
+
+    pub(crate) fn rollback(&mut self, checkpoint: HistoryRollback) {
+        let changed = !Arc::ptr_eq(&self.snapshot.messages, &checkpoint.messages)
+            || !same_opt_arc(&self.snapshot.frame, &checkpoint.frame)
+            || !same_opt_arc(&self.snapshot.title_source, &checkpoint.title_source)
+            || !same_live_frame(self.live.as_ref(), checkpoint.live.as_ref());
+        self.snapshot.messages = checkpoint.messages;
+        self.snapshot.frame = checkpoint.frame;
+        self.snapshot.title_source = checkpoint.title_source;
+        self.live = checkpoint.live;
+        self.unsaved = checkpoint.unsaved;
+        self.rolled_back = checkpoint.clean_turn;
+        self.snapshot.archive_drop = false;
+        if changed {
+            self.snapshot.epoch = next_epoch();
+            self.publish();
+        }
+    }
+
+    pub(crate) fn clear_rolled_back(&mut self) {
+        self.rolled_back = false;
+    }
+
+    pub(crate) fn take_rolled_back(&mut self) -> bool {
+        mem::take(&mut self.rolled_back)
     }
 
     /// Call before [`Self::with_mirror`], which publishes.
@@ -219,6 +305,7 @@ impl History {
         self.live = Some(live);
         self.snapshot.frame = Some(Arc::new(stored));
         self.unsaved = true;
+        self.rolled_back = false;
         self.publish();
     }
 
@@ -245,6 +332,7 @@ impl History {
 
     pub fn mark_saved(&mut self) {
         self.unsaved = false;
+        self.rolled_back = false;
     }
 
     pub fn with_mirror(mut self, mirror: SharedMessages) -> Self {
@@ -376,12 +464,14 @@ impl History {
     fn edit(&mut self, f: impl FnOnce(&mut Vec<Message>)) {
         f(Arc::make_mut(&mut self.snapshot.messages));
         self.unsaved = true;
+        self.rolled_back = false;
         self.publish();
     }
 
     /// Any other change, so a consumer has to start the list over.
     fn rewrite(&mut self, f: impl FnOnce(&mut Vec<Message>)) {
         self.snapshot.epoch = next_epoch();
+        self.snapshot.archive_drop = true;
         self.edit(f);
     }
 

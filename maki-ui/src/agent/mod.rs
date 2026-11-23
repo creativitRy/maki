@@ -552,6 +552,7 @@ mod tests {
                 mode: AgentMode::default(),
                 images: Vec::new(),
                 preamble: Vec::new(),
+                woken_notices: Vec::new(),
                 earlier: Vec::new(),
                 thinking: ThinkingConfig::default(),
                 fast: false,
