@@ -75,6 +75,7 @@ pub(crate) const SEARCH_EMPTY_QUERY: &str = "query must not be empty";
 pub const USAGE_PREFIX: &str = "Usage:";
 const PROMPT_ERROR_TOOL: &str = "mcp_prompt";
 const MCP_UNAVAILABLE: &str = "MCP not available";
+const RUNTIME_OVERRIDE_SERVER: &str = "gw";
 
 /// Convert internal qualified name (`server.tool`) to wire format (`server__tool`)
 /// for LLM provider APIs that reject dots in tool names.
@@ -838,9 +839,9 @@ pub async fn start_connected(
     (handle, config_errors)
 }
 
-/// `start` plus servers declared at runtime. `mcp.toml` wins on name, so a
-/// runtime server can never swap out the credentials the user configured or
-/// revive one they disabled.
+/// `start` plus servers declared at runtime. `mcp.toml` wins on name except for
+/// [`RUNTIME_OVERRIDE_SERVER`], so a runtime server cannot swap user credentials
+/// or revive a disabled server.
 pub async fn start_with_extra(
     cwd: &Path,
     project_config: ProjectConfig,
@@ -856,6 +857,13 @@ pub async fn start_with_extra(
 fn merge_runtime_servers(config: &mut McpConfig, extra: Vec<(String, RawTransport)>) {
     for (name, transport) in extra {
         let always_load = config.always_load.contains(&name);
+        if name == RUNTIME_OVERRIDE_SERVER {
+            config.origins.remove(&name);
+            let mut raw = RawServerConfig::runtime(transport);
+            raw.always_load = always_load;
+            config.mcp.insert(name, raw);
+            continue;
+        }
         match config.mcp.entry(name) {
             Entry::Vacant(slot) => {
                 let mut raw = RawServerConfig::runtime(transport);
@@ -1504,6 +1512,7 @@ mod tests {
     const RUNTIME_URL: &str = "http://127.0.0.1:9999/mcp";
     const RUNTIME_ALWAYS_LOAD_SERVER: &str = "ide";
     const RUNTIME_DEFERRED_SERVER: &str = "other";
+    const RUNTIME_ADDED_SERVER: &str = "added";
     const GHOST_ALWAYS_LOAD_SERVER: &str = "ghost";
 
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {
@@ -2518,5 +2527,55 @@ mod tests {
         assert_eq!(inner.entries.len(), 1);
         assert_eq!(inner.entries[0].name, SERVER);
         assert!(inner.entries[0].config.as_ref().unwrap().always_load);
+    }
+
+    #[test_case(true  ; "overrides_enabled_gw")]
+    #[test_case(false ; "overrides_disabled_gw")]
+    fn merge_runtime_servers_overrides_gw_and_clears_origin(existing_enabled: bool) {
+        let mut existing = stdio_raw(&["old"]);
+        existing.enabled = existing_enabled;
+        let mut config = make_config(vec![(RUNTIME_OVERRIDE_SERVER, existing)]);
+        config.always_load = HashSet::from([RUNTIME_OVERRIDE_SERVER.into()]);
+
+        merge_runtime_servers(
+            &mut config,
+            vec![(
+                RUNTIME_OVERRIDE_SERVER.into(),
+                runtime_http_transport(RUNTIME_URL),
+            )],
+        );
+
+        let gw = &config.mcp[RUNTIME_OVERRIDE_SERVER];
+        assert!(gw.enabled);
+        assert!(gw.always_load);
+        assert!(!config.origins.contains_key(RUNTIME_OVERRIDE_SERVER));
+        match &gw.transport {
+            RawTransport::Http(http) => assert_eq!(http.url, RUNTIME_URL),
+            _ => panic!("expected Http"),
+        }
+    }
+
+    #[test]
+    fn merge_runtime_servers_keeps_non_gw_toml_entry() {
+        let mut config = make_config(vec![(SERVER, stdio_raw(&["from-toml"]))]);
+        let origin_before = config.origins[SERVER].clone();
+
+        merge_runtime_servers(
+            &mut config,
+            vec![
+                (SERVER.into(), runtime_http_transport(RUNTIME_URL)),
+                (
+                    RUNTIME_ADDED_SERVER.into(),
+                    runtime_http_transport(RUNTIME_URL),
+                ),
+            ],
+        );
+
+        assert!(matches!(
+            config.mcp[SERVER].transport,
+            RawTransport::Stdio(_)
+        ));
+        assert_eq!(config.origins.get(SERVER), Some(&origin_before));
+        assert!(config.mcp.contains_key(RUNTIME_ADDED_SERVER));
     }
 }
