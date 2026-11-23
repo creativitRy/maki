@@ -13,6 +13,7 @@ use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, ProjectDecision, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{Config, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::{InitFiles, Interaction, PackPlan, PackReport, PluginHost};
+use maki_providers::Timeouts;
 use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_ui::{OpenSession, RunOutcome};
@@ -38,8 +39,12 @@ struct Stack {
 }
 
 impl Stack {
-    fn timeouts(&self) -> maki_providers::Timeouts {
-        maki_providers::Timeouts::from(&self.config.provider)
+    fn timeouts(&self, fail_fast_rate_limit: bool) -> Timeouts {
+        let mut timeouts = Timeouts::from(&self.config.provider);
+        if fail_fast_rate_limit {
+            timeouts.retry.apply_fail_fast_rate_limit();
+        }
+        timeouts
     }
 }
 
@@ -393,7 +398,7 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
             .collect_prompt_slots(Some(resolved.id.as_str()))
             .await;
         let (resumed, claim) = resolved.into_resumed();
-        let timeouts = stack.timeouts();
+        let timeouts = stack.timeouts(cli.fail_fast_rate_limit);
         let interrupt = crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,
             resumed,
@@ -420,7 +425,7 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
 
     if cli.print {
         let (resumed, claim) = resolved.into_resumed();
-        let timeouts = stack.timeouts();
+        let timeouts = stack.timeouts(cli.fail_fast_rate_limit);
         let background_wait = cli.background_wait();
         let host_prompt = cli.host_prompt();
         let interrupt = crate::print::run(crate::print::PrintParams {
@@ -507,7 +512,7 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
                     trust.project_config.clone(),
                     stack.plugin_host.plugin_rules(),
                 )),
-                timeouts: stack.timeouts(),
+                timeouts: stack.timeouts(cli.fail_fast_rate_limit),
                 exit_on_done: cli.exit_on_done,
                 background_wait: cli.background_wait(),
                 lua_command_reader: stack.plugin_host.command_reader(),

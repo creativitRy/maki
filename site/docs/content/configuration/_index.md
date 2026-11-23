@@ -167,6 +167,9 @@ With 0 you see only the header. The read, index and list tools default to 0, bec
 | `retry_max_ms` | u64 | `60000` | 1 | Cap on the guessed retry backoff (milliseconds) |
 | `max_retries` | u32 | `5` | - | Max retries on a rate limit the server sent no Retry-After for, 0 to never retry them |
 | `max_timeout_retries` | u32 | `10` | - | Max retries on stream timeouts |
+| `max_transient_retries` | u32 | `none` | - | Max retries on transient (5xx / network) errors, 0 to never retry them |
+| `max_hinted_rate_limit_retries` | u32 | `none` | - | Max retries on a rate limit with Retry-After, 0 to fail fast |
+| `max_retry_after_secs` | u64 | `none` | - | Max Retry-After wait before failing immediately (seconds), 0 to never sleep on Retry-After |
 
 ### `storage`
 

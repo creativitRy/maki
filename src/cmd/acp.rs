@@ -9,6 +9,7 @@ use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, ProjectDecision, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{Config, load_env_files};
 use maki_lua::{InitFiles, Interaction, PluginHost};
+use maki_providers::Timeouts;
 use maki_storage::StateDir;
 
 use crate::cli::Cli;
@@ -88,7 +89,10 @@ pub async fn run(
     warnings.extend(legacy_notice);
     super::report_warnings(warnings);
 
-    let timeouts = maki_providers::Timeouts::from(&config.provider);
+    let mut timeouts = Timeouts::from(&config.provider);
+    if cli.fail_fast_rate_limit {
+        timeouts.retry.apply_fail_fast_rate_limit();
+    }
 
     let (model, warning) =
         setup::resolve_model(model_arg.as_deref(), &config.provider, &storage).await?;

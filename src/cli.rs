@@ -208,6 +208,9 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub permission_prompt_tool: Option<String>,
 
+    #[arg(long, global = true, hide = true)]
+    pub fail_fast_rate_limit: bool,
+
     // Accepted but ignored, so Claude Code SDK callers don't break.
     #[arg(long, hide = true)]
     pub fallback_model: Option<String>,
@@ -715,5 +718,12 @@ mod tests {
         for name in scoped.iter().chain(UNGUARDED_FLAGS) {
             assert!(flags.contains(name), "--{name} is not a flag");
         }
+    }
+
+    #[test_case(&["acp"], false ; "defaults_to_false")]
+    #[test_case(&["acp", "--fail-fast-rate-limit"], true ; "after_subcommand")]
+    #[test_case(&["--background-timeout", "0", "--fail-fast-rate-limit", "--allowed-tools", "websearch,webfetch,index,todo_write", "acp"], true ; "before_subcommand_with_flags")]
+    fn fail_fast_rate_limit_parses_in_any_position(args: &[&str], expected: bool) {
+        assert_eq!(parse(args).fail_fast_rate_limit, expected);
     }
 }

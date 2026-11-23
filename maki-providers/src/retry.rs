@@ -12,6 +12,8 @@ use tracing::warn;
 /// a headless or acp turn for a day with nobody around to press esc is not an
 /// option.
 const RETRY_AFTER_CAP: Duration = Duration::from_secs(60 * 60);
+const FAIL_FAST_TRANSIENT_HINT_MAX: Duration = Duration::from_secs(5);
+const FAIL_FAST_MAX_TRANSIENT_RETRIES: u32 = 2;
 
 /// What kind of failure a retry is paying for. The ways out of here are not
 /// the same: some errors say "the provider is having a bad day", one says "you
@@ -75,8 +77,10 @@ impl Budget {
 
     fn limit(self, policy: &RetryPolicy) -> Option<u32> {
         match self {
-            Self::Transient | Self::HintedRateLimit => None,
-            Self::RateLimit | Self::Connect => Some(policy.max_retries),
+            Self::Transient => policy.max_transient_retries,
+            Self::HintedRateLimit => policy.max_hinted_rate_limit_retries,
+            Self::RateLimit => Some(policy.max_rate_limit_retries.unwrap_or(policy.max_retries)),
+            Self::Connect => Some(policy.max_retries),
             Self::Timeout => Some(policy.max_timeout_retries),
         }
     }
@@ -94,6 +98,32 @@ pub struct RetryPolicy {
     /// never retries either.
     pub max_retries: u32,
     pub max_timeout_retries: u32,
+    pub max_transient_retries: Option<u32>,
+    pub max_hinted_rate_limit_retries: Option<u32>,
+    /// Cap on server-sent `Retry-After` waits; `None` trims hints to
+    /// [`RETRY_AFTER_CAP`], while `Some(max)` fails fast above `max` and
+    /// honors waits up to `max`.
+    pub max_retry_after: Option<Duration>,
+    pub max_rate_limit_retries: Option<u32>,
+}
+
+impl RetryPolicy {
+    pub fn apply_fail_fast_rate_limit(&mut self) {
+        self.max_rate_limit_retries = Some(0);
+        self.max_hinted_rate_limit_retries = Some(0);
+        self.max_transient_retries = Some(
+            self.max_transient_retries
+                .map_or(FAIL_FAST_MAX_TRANSIENT_RETRIES, |limit| {
+                    limit.min(FAIL_FAST_MAX_TRANSIENT_RETRIES)
+                }),
+        );
+        self.max_retry_after = Some(
+            self.max_retry_after
+                .map_or(FAIL_FAST_TRANSIENT_HINT_MAX, |limit| {
+                    limit.min(FAIL_FAST_TRANSIENT_HINT_MAX)
+                }),
+        );
+    }
 }
 
 impl Default for RetryPolicy {
@@ -103,6 +133,10 @@ impl Default for RetryPolicy {
             max_delay: Duration::from_millis(DEFAULT_RETRY_MAX_MS),
             max_retries: DEFAULT_MAX_RETRIES,
             max_timeout_retries: DEFAULT_MAX_TIMEOUT_RETRIES,
+            max_transient_retries: None,
+            max_hinted_rate_limit_retries: None,
+            max_retry_after: None,
+            max_rate_limit_retries: None,
         }
     }
 }
@@ -114,6 +148,10 @@ impl From<&ProviderConfig> for RetryPolicy {
             max_delay: Duration::from_millis(config.retry_max_ms),
             max_retries: config.max_retries,
             max_timeout_retries: config.max_timeout_retries,
+            max_transient_retries: config.max_transient_retries,
+            max_hinted_rate_limit_retries: config.max_hinted_rate_limit_retries,
+            max_retry_after: config.max_retry_after,
+            max_rate_limit_retries: None,
         }
     }
 }
@@ -163,6 +201,11 @@ impl RetryState {
     /// `Retry-After` the server sent, and it knows its own window better than
     /// we do, within [`RetryPolicy::base_delay`] and [`RETRY_AFTER_CAP`].
     pub fn next_delay(&mut self, kind: RetryKind, hint: Option<Duration>) -> Option<Duration> {
+        if let (Some(after), Some(max_after)) = (hint, self.policy.max_retry_after)
+            && (max_after.is_zero() || after > max_after)
+        {
+            return None;
+        }
         let budget = Budget::of(kind, hint);
         let spent = &mut self.spent[budget as usize];
         if budget
@@ -181,10 +224,11 @@ impl RetryState {
         let Some(after) = hint else {
             return Some(self.backoff(attempt));
         };
-        if after > RETRY_AFTER_CAP {
+        let cap = self.policy.max_retry_after.unwrap_or(RETRY_AFTER_CAP);
+        if after > cap {
             warn!(
                 retry_after_ms = after.as_millis() as u64,
-                cap_ms = RETRY_AFTER_CAP.as_millis() as u64,
+                cap_ms = cap.as_millis() as u64,
                 "Retry-After above cap, trimming"
             );
         }
@@ -192,7 +236,7 @@ impl RetryState {
         // server answering `Retry-After: 1` forever would otherwise become a
         // one-request-per-second hammer on the rate limiter that is already
         // saying no.
-        Some(after.clamp(self.policy.base_delay.min(RETRY_AFTER_CAP), RETRY_AFTER_CAP))
+        Some(after.clamp(self.policy.base_delay.min(cap), cap))
     }
 
     /// Half the backoff, plus jitter on top, so a fleet of clients knocked back
@@ -223,6 +267,21 @@ mod tests {
     const ONE_KEY: usize = 1;
     /// A pool big enough that a walk over it is obviously more than one step.
     const KEYS: usize = 3;
+    const SHORT_HINT: Duration = Duration::from_secs(1);
+    const LONG_HINT: Duration = Duration::from_secs(6);
+    const BELOW_BASE_CAP: Duration = Duration::from_millis(50);
+    const TINY_HINT: Duration = Duration::from_millis(10);
+    const TEST_RETRY_BUDGET: u32 = 4;
+    const TEST_TIMEOUT_BUDGET: u32 = 3;
+    const BOUNDED_RETRIES: u32 = 2;
+    const CONFIG_TRANSIENT: u32 = 3;
+    const CONFIG_HINTED: u32 = 1;
+    const CONFIG_MAX_AFTER: Duration = Duration::from_secs(12);
+    const STRICT_TRANSIENT: u32 = 1;
+    const STRICT_WAIT: Duration = Duration::from_secs(2);
+    const EXPLICIT_HIGH_CAP: Duration = Duration::from_secs(7_200);
+    const WITHIN_HIGH_CAP_HINT: Duration = Duration::from_secs(5_000);
+    const OVER_HIGH_CAP_HINT: Duration = Duration::from_secs(7_201);
 
     fn state(max_retries: u32, max_timeout_retries: u32) -> RetryState {
         RetryState::new(
@@ -231,6 +290,7 @@ mod tests {
                 max_delay: MAX,
                 max_retries,
                 max_timeout_retries,
+                ..RetryPolicy::default()
             },
             ONE_KEY,
         )
@@ -342,11 +402,221 @@ mod tests {
                 max_delay: MAX,
                 max_retries: RETRIES,
                 max_timeout_retries: RETRIES,
+                ..RetryPolicy::default()
             },
             KEYS,
         );
         assert_eq!(walk(&mut state), KEYS as u32 - 1);
         assert_eq!(spend(&mut state, RetryKind::RateLimit), RETRIES);
         assert_eq!(spend(&mut state, RetryKind::Timeout), RETRIES);
+    }
+
+    fn count_retries(state: &mut RetryState, kind: RetryKind, hint: Option<Duration>) -> u32 {
+        (0..MANY)
+            .take_while(|_| state.next_delay(kind, hint).is_some())
+            .count() as u32
+    }
+
+    #[test_case(None, None, MANY ; "unbounded_unhinted")]
+    #[test_case(Some(0), None, 0 ; "zero_disables_unhinted")]
+    #[test_case(Some(0), Some(SHORT_HINT), 0 ; "zero_disables_hinted")]
+    #[test_case(Some(BOUNDED_RETRIES), None, BOUNDED_RETRIES ; "capped_unhinted")]
+    #[test_case(Some(BOUNDED_RETRIES), Some(SHORT_HINT), BOUNDED_RETRIES ; "capped_hinted")]
+    fn max_transient_retries_bounds_transient_attempts(
+        cap: Option<u32>,
+        hint: Option<Duration>,
+        expected: u32,
+    ) {
+        let mut state = RetryState::new(
+            RetryPolicy {
+                base_delay: BASE,
+                max_delay: MAX,
+                max_transient_retries: cap,
+                ..RetryPolicy::default()
+            },
+            ONE_KEY,
+        );
+        assert_eq!(
+            count_retries(&mut state, RetryKind::Transient, hint),
+            expected
+        );
+    }
+
+    #[test_case(None, MANY ; "unbounded_hinted_rate_limit")]
+    #[test_case(Some(0), 0 ; "zero_fails_fast_on_hinted_rate_limit")]
+    #[test_case(Some(BOUNDED_RETRIES), BOUNDED_RETRIES ; "capped_hinted_rate_limit")]
+    fn max_hinted_rate_limit_retries_leaves_unhinted_alone(cap: Option<u32>, expected: u32) {
+        let mut state = RetryState::new(
+            RetryPolicy {
+                base_delay: BASE,
+                max_delay: MAX,
+                max_retries: TEST_RETRY_BUDGET,
+                max_hinted_rate_limit_retries: cap,
+                ..RetryPolicy::default()
+            },
+            ONE_KEY,
+        );
+        assert_eq!(
+            count_retries(&mut state, RetryKind::RateLimit, Some(SHORT_HINT)),
+            expected
+        );
+        assert_eq!(
+            count_retries(&mut state, RetryKind::RateLimit, None),
+            TEST_RETRY_BUDGET
+        );
+    }
+
+    #[test]
+    fn max_retry_after_zero_rejects_hints_without_spending_budget() {
+        let mut state = RetryState::new(
+            RetryPolicy {
+                base_delay: BASE,
+                max_delay: MAX,
+                max_retries: TEST_RETRY_BUDGET,
+                max_retry_after: Some(Duration::ZERO),
+                ..RetryPolicy::default()
+            },
+            ONE_KEY,
+        );
+        assert_eq!(
+            state.next_delay(RetryKind::RateLimit, Some(Duration::ZERO)),
+            None
+        );
+        assert_eq!(
+            state.next_delay(RetryKind::RateLimit, Some(SHORT_HINT)),
+            None
+        );
+        assert_eq!(
+            state.next_delay(RetryKind::Transient, Some(Duration::ZERO)),
+            None
+        );
+        assert_eq!(
+            count_retries(&mut state, RetryKind::RateLimit, None),
+            TEST_RETRY_BUDGET
+        );
+    }
+
+    #[test]
+    fn max_retry_after_enforces_threshold_and_sub_base_cap() {
+        let mut bounded = RetryState::new(
+            RetryPolicy {
+                base_delay: BASE,
+                max_delay: MAX,
+                max_retries: TEST_RETRY_BUDGET,
+                max_transient_retries: Some(BOUNDED_RETRIES),
+                max_retry_after: Some(FAIL_FAST_TRANSIENT_HINT_MAX),
+                ..RetryPolicy::default()
+            },
+            ONE_KEY,
+        );
+        assert_eq!(
+            bounded.next_delay(RetryKind::Transient, Some(LONG_HINT)),
+            None
+        );
+        assert_eq!(
+            count_retries(
+                &mut bounded,
+                RetryKind::Transient,
+                Some(FAIL_FAST_TRANSIENT_HINT_MAX),
+            ),
+            BOUNDED_RETRIES
+        );
+
+        let mut below_base = RetryState::new(
+            RetryPolicy {
+                base_delay: BASE,
+                max_delay: MAX,
+                max_retry_after: Some(BELOW_BASE_CAP),
+                ..RetryPolicy::default()
+            },
+            ONE_KEY,
+        );
+        assert_eq!(
+            below_base.next_delay(RetryKind::RateLimit, Some(TINY_HINT)),
+            Some(BELOW_BASE_CAP)
+        );
+        assert_eq!(
+            below_base.next_delay(RetryKind::RateLimit, Some(SHORT_HINT)),
+            None
+        );
+    }
+
+    #[test]
+    fn from_provider_config_forwards_retry_bounds() {
+        let config = ProviderConfig {
+            max_transient_retries: Some(CONFIG_TRANSIENT),
+            max_hinted_rate_limit_retries: Some(CONFIG_HINTED),
+            max_retry_after: Some(CONFIG_MAX_AFTER),
+            ..ProviderConfig::default()
+        };
+        let policy = RetryPolicy::from(&config);
+        assert_eq!(policy.max_transient_retries, Some(CONFIG_TRANSIENT));
+        assert_eq!(policy.max_hinted_rate_limit_retries, Some(CONFIG_HINTED));
+        assert_eq!(policy.max_retry_after, Some(CONFIG_MAX_AFTER));
+        assert_eq!(policy.max_rate_limit_retries, None);
+    }
+
+    #[test]
+    fn explicit_max_retry_after_can_exceed_default_cap() {
+        let mut state = RetryState::new(
+            RetryPolicy {
+                base_delay: BASE,
+                max_delay: MAX,
+                max_retry_after: Some(EXPLICIT_HIGH_CAP),
+                ..RetryPolicy::default()
+            },
+            ONE_KEY,
+        );
+        assert_eq!(
+            state.next_delay(RetryKind::RateLimit, Some(WITHIN_HIGH_CAP_HINT)),
+            Some(WITHIN_HIGH_CAP_HINT)
+        );
+        assert_eq!(
+            state.next_delay(RetryKind::RateLimit, Some(OVER_HIGH_CAP_HINT)),
+            None
+        );
+    }
+
+    fn fail_fast_policy() -> RetryPolicy {
+        let mut policy = RetryPolicy {
+            base_delay: BASE,
+            max_delay: MAX,
+            max_retries: TEST_RETRY_BUDGET,
+            max_timeout_retries: TEST_TIMEOUT_BUDGET,
+            ..RetryPolicy::default()
+        };
+        policy.apply_fail_fast_rate_limit();
+        policy
+    }
+
+    #[test_case(RetryKind::RateLimit, None, 0 ; "unhinted_rate_limit_fails_fast")]
+    #[test_case(RetryKind::RateLimit, Some(SHORT_HINT), 0 ; "hinted_rate_limit_fails_fast")]
+    #[test_case(RetryKind::Transient, Some(LONG_HINT), 0 ; "transient_with_long_hint_fails_fast")]
+    #[test_case(RetryKind::Transient, None, FAIL_FAST_MAX_TRANSIENT_RETRIES ; "unhinted_transient_caps_at_two")]
+    #[test_case(RetryKind::Transient, Some(FAIL_FAST_TRANSIENT_HINT_MAX), FAIL_FAST_MAX_TRANSIENT_RETRIES ; "short_hint_transient_caps_at_two")]
+    #[test_case(RetryKind::Connect, None, TEST_RETRY_BUDGET ; "connect_budget_unchanged")]
+    #[test_case(RetryKind::Timeout, None, TEST_TIMEOUT_BUDGET ; "timeout_budget_unchanged")]
+    fn apply_fail_fast_rate_limit_bounds_expected_categories(
+        kind: RetryKind,
+        hint: Option<Duration>,
+        expected: u32,
+    ) {
+        let mut state = RetryState::new(fail_fast_policy(), ONE_KEY);
+        assert_eq!(count_retries(&mut state, kind, hint), expected);
+    }
+
+    #[test]
+    fn apply_fail_fast_rate_limit_preserves_stricter_config() {
+        let mut policy = RetryPolicy {
+            max_transient_retries: Some(STRICT_TRANSIENT),
+            max_retry_after: Some(STRICT_WAIT),
+            ..RetryPolicy::default()
+        };
+        policy.apply_fail_fast_rate_limit();
+
+        assert_eq!(policy.max_transient_retries, Some(STRICT_TRANSIENT));
+        assert_eq!(policy.max_retry_after, Some(STRICT_WAIT));
+        assert_eq!(policy.max_rate_limit_retries, Some(0));
+        assert_eq!(policy.max_hinted_rate_limit_retries, Some(0));
     }
 }

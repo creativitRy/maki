@@ -832,6 +832,9 @@ pub struct ProviderFileConfig {
     pub retry_max_ms: Option<u64>,
     pub max_retries: Option<u32>,
     pub max_timeout_retries: Option<u32>,
+    pub max_transient_retries: Option<u32>,
+    pub max_hinted_rate_limit_retries: Option<u32>,
+    pub max_retry_after_secs: Option<u64>,
 }
 
 #[derive(Deserialize, Default, Debug, Merge)]
@@ -1551,6 +1554,28 @@ pub struct ProviderConfig {
     #[config(key = "max_timeout_retries", ty = "u32", default = DEFAULT_MAX_TIMEOUT_RETRIES,
              desc = "Max retries on stream timeouts")]
     pub max_timeout_retries: u32,
+
+    #[config(
+        ty = "u32",
+        default_doc = "none",
+        desc = "Max retries on transient (5xx / network) errors, 0 to never retry them"
+    )]
+    pub max_transient_retries: Option<u32>,
+
+    #[config(
+        ty = "u32",
+        default_doc = "none",
+        desc = "Max retries on a rate limit with Retry-After, 0 to fail fast"
+    )]
+    pub max_hinted_rate_limit_retries: Option<u32>,
+
+    #[config(
+        key = "max_retry_after_secs",
+        ty = "u64",
+        default_doc = "none",
+        desc = "Max Retry-After wait before failing immediately (seconds), 0 to never sleep on Retry-After"
+    )]
+    pub max_retry_after: Option<Duration>,
 }
 
 impl Default for ProviderConfig {
@@ -1567,6 +1592,9 @@ impl Default for ProviderConfig {
             retry_max_ms: DEFAULT_RETRY_MAX_MS,
             max_retries: DEFAULT_MAX_RETRIES,
             max_timeout_retries: DEFAULT_MAX_TIMEOUT_RETRIES,
+            max_transient_retries: None,
+            max_hinted_rate_limit_retries: None,
+            max_retry_after: None,
         }
     }
 }
@@ -1596,6 +1624,9 @@ impl ProviderConfig {
             retry_max_ms: f.retry_max_ms.unwrap_or(DEFAULT_RETRY_MAX_MS),
             max_retries: f.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
             max_timeout_retries: f.max_timeout_retries.unwrap_or(DEFAULT_MAX_TIMEOUT_RETRIES),
+            max_transient_retries: f.max_transient_retries,
+            max_hinted_rate_limit_retries: f.max_hinted_rate_limit_retries,
+            max_retry_after: f.max_retry_after_secs.map(Duration::from_secs),
         })
     }
 }
@@ -3061,6 +3092,9 @@ mod tests {
             provider: ProviderFileConfig {
                 max_retries: Some(3),
                 retry_base_ms: Some(50),
+                max_transient_retries: Some(4),
+                max_hinted_rate_limit_retries: Some(1),
+                max_retry_after_secs: Some(15),
                 ..Default::default()
             },
             ..Default::default()
@@ -3069,6 +3103,40 @@ mod tests {
         .unwrap();
         assert_eq!(config.provider.max_retries, 3);
         assert_eq!(config.provider.retry_base_ms, 50);
+        assert_eq!(config.provider.max_transient_retries, Some(4));
+        assert_eq!(config.provider.max_hinted_rate_limit_retries, Some(1));
+        assert_eq!(
+            config.provider.max_retry_after,
+            Some(Duration::from_secs(15))
+        );
+    }
+
+    #[test]
+    fn retry_bounds_default_to_unbounded_and_accept_zero() {
+        let from_file = RawConfig::default().into_config(&[]).unwrap().provider;
+        let defaults = ProviderConfig::default();
+        assert_eq!(from_file.max_transient_retries, None);
+        assert_eq!(defaults.max_transient_retries, None);
+        assert_eq!(from_file.max_hinted_rate_limit_retries, None);
+        assert_eq!(defaults.max_hinted_rate_limit_retries, None);
+        assert_eq!(from_file.max_retry_after, None);
+        assert_eq!(defaults.max_retry_after, None);
+
+        let zeroed = RawConfig {
+            provider: ProviderFileConfig {
+                max_transient_retries: Some(0),
+                max_hinted_rate_limit_retries: Some(0),
+                max_retry_after_secs: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .into_config(&[])
+        .unwrap()
+        .provider;
+        assert_eq!(zeroed.max_transient_retries, Some(0));
+        assert_eq!(zeroed.max_hinted_rate_limit_retries, Some(0));
+        assert_eq!(zeroed.max_retry_after, Some(Duration::ZERO));
     }
 
     #[test]
