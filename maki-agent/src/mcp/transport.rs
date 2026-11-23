@@ -18,13 +18,14 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderName, HeaderValue};
 use reqwest::redirect::{Action, Attempt, Policy};
 use reqwest::{Certificate, Client, ClientBuilder, Error as ReqwestError, StatusCode};
 use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, ClientConfig, ClientRequest, ConstString,
+    CallToolRequest, CallToolRequestMethod, CallToolRequestParams, CallToolResult,
+    CancelledNotificationParam, ClientCapabilities, ClientConfig, ClientRequest, ConstString,
     ContentBlock, ErrorCode, ErrorData, GetPromptRequestParams, Implementation, InitializeResult,
     InitializeResultMethod, ListPromptsRequest, ListPromptsRequestMethod, ListToolsRequest,
-    ListToolsRequestMethod, PaginatedRequestParams, Prompt, ProtocolVersion, Role, ServerResult,
-    Tool,
+    ListToolsRequestMethod, PaginatedRequestParams, Prompt, ProtocolVersion, RequestId, Role,
+    ServerResult, Tool,
 };
-use rmcp::service::{ClientInitializeError, Peer, RunningService};
+use rmcp::service::{ClientInitializeError, Peer, PeerRequestOptions, RunningService};
 use rmcp::transport::common::http_header::{HEADER_LAST_EVENT_ID, HEADER_SESSION_ID};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransportConfig, StreamableHttpError,
@@ -38,6 +39,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::runtime::Handle;
 use tokio::time::timeout;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{info, warn};
@@ -49,6 +51,35 @@ use crate::ChildGuard;
 
 pub(super) const CLIENT_NAME: &str = "maki";
 const TOOL_ERROR_CODE: i64 = -1;
+const MAX_TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(3600);
+
+struct CancelOnDrop {
+    peer: Peer<RoleClient>,
+    id: Option<RequestId>,
+}
+
+impl CancelOnDrop {
+    fn disarm(&mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        let Some(id) = self.id.take() else {
+            return;
+        };
+        let Ok(handle) = Handle::try_current() else {
+            return;
+        };
+        let peer = self.peer.clone();
+        handle.spawn(async move {
+            let _ = peer
+                .notify_cancelled(CancelledNotificationParam::new(Some(id), None))
+                .await;
+        });
+    }
+}
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -189,9 +220,7 @@ impl Connection {
         self.request(self.peer.send_request(request.into())).await
     }
 
-    /// Bounds a request by the server's timeout. A tool call dropped
-    /// mid-flight, by this timeout or a cancelled turn, sends the server
-    /// `notifications/cancelled`.
+    /// Bounds a request by the server's timeout.
     async fn request<T>(
         &self,
         call: impl Future<Output = Result<T, ServiceError>>,
@@ -201,6 +230,58 @@ impl Connection {
         })
         .await
     }
+
+    async fn call_tool_with_max_timeout(
+        &self,
+        name: &str,
+        args: &Value,
+        max_total_timeout: Duration,
+    ) -> Result<String, McpError> {
+        let start = Instant::now();
+        let mut params = CallToolRequestParams::new(name.to_owned());
+        if let Value::Object(arguments) = args {
+            params = params.with_arguments(arguments.clone());
+        }
+        let req = ClientRequest::CallToolRequest(CallToolRequest::new(params));
+        let opts = PeerRequestOptions::with_timeout(self.timeout)
+            .reset_timeout_on_progress()
+            .with_max_total_timeout(max_total_timeout);
+        let handle = within(self.timeout, &self.name, async {
+            self.peer
+                .send_request_with_option(req, opts)
+                .await
+                .map_err(|e| service_error(&self.name, e))
+        })
+        .await?;
+        let mut cancel_on_drop = CancelOnDrop {
+            peer: self.peer.clone(),
+            id: Some(handle.id.clone()),
+        };
+        let reply = handle
+            .await_response()
+            .await
+            .map_err(|e| service_error(&self.name, e));
+        cancel_on_drop.disarm();
+        let result = match reply? {
+            ServerResult::CallToolResult(result) => result,
+            other => reparse::<CallToolResult>(&self.name, CallToolRequestMethod::VALUE, &other)?,
+        };
+        let text = joined_text(&result.content);
+        if result.is_error == Some(true) {
+            return Err(McpError::RpcError {
+                server: self.name.to_string(),
+                code: TOOL_ERROR_CODE,
+                message: text,
+            });
+        }
+        info!(
+            server = &*self.name,
+            tool = name,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "MCP tools/call response"
+        );
+        Ok(text)
+    }
 }
 
 impl McpTransport for Connection {
@@ -209,29 +290,7 @@ impl McpTransport for Connection {
         name: &'a str,
         args: &'a Value,
     ) -> BoxFuture<'a, Result<String, McpError>> {
-        Box::pin(async move {
-            let start = Instant::now();
-            let mut params = CallToolRequestParams::new(name.to_owned());
-            if let Value::Object(arguments) = args {
-                params = params.with_arguments(arguments.clone());
-            }
-            let result = self.request(self.peer.call_tool(params)).await?;
-            let text = joined_text(&result.content);
-            if result.is_error == Some(true) {
-                return Err(McpError::RpcError {
-                    server: self.name.to_string(),
-                    code: TOOL_ERROR_CODE,
-                    message: text,
-                });
-            }
-            info!(
-                server = &*self.name,
-                tool = name,
-                duration_ms = start.elapsed().as_millis() as u64,
-                "MCP tools/call response"
-            );
-            Ok(text)
-        })
+        Box::pin(self.call_tool_with_max_timeout(name, args, MAX_TOOL_CALL_TIMEOUT))
     }
 
     fn get_prompt<'a>(
@@ -625,6 +684,10 @@ fn init_error(server: &str, error: ClientInitializeError) -> McpError {
 fn service_error(server: &str, error: ServiceError) -> McpError {
     match error {
         ServiceError::McpError(e) => rpc_error(server, e),
+        ServiceError::Timeout { timeout } => McpError::Timeout {
+            server: server.into(),
+            timeout_ms: timeout.as_millis() as u64,
+        },
         ServiceError::TransportClosed => McpError::ServerDied {
             server: server.into(),
         },
@@ -647,6 +710,7 @@ mod tests {
     use std::io::{BufRead, BufReader as StdBufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::channel;
     use std::thread;
 
@@ -661,6 +725,13 @@ mod tests {
     /// The server is in-process on loopback, so this only has to catch a
     /// client that never gets an answer at all.
     const TIMEOUT: Duration = Duration::from_secs(10);
+    const WATCHDOG_TIMEOUT: Duration = Duration::from_millis(500);
+    const PROGRESS_STEP_DELAY: Duration = Duration::from_millis(120);
+    const PROGRESS_STEPS: usize = 6;
+    const MAX_TOTAL_TEST_TIMEOUT: Duration = Duration::from_millis(900);
+    const INFINITE_PROGRESS_STEP: Duration = Duration::from_millis(100);
+    const NO_EXTRA_CANCEL_WAIT: Duration = Duration::from_millis(150);
+    const DUPLICATE_CANCEL_MSG: &str = "duplicate notifications/cancelled sent";
     const SESSION_ID: &str = "session-1";
     const TOOL_TEXT: &str = "hi";
     const FIRST_TOOL: &str = "first";
@@ -783,27 +854,47 @@ mod tests {
     fn spawn_server_with_base(
         handler: impl Fn(&str, &Request) -> Reply + Send + Sync + 'static,
     ) -> String {
+        spawn_tcp_server(move |base, mut stream| {
+            let Some(req) = read_request(&mut stream) else {
+                return;
+            };
+            write_reply(&mut stream, handler(base, &req));
+        })
+    }
+
+    fn spawn_stream_server(
+        handler: impl Fn(TcpStream, &Request) + Send + Sync + 'static,
+    ) -> String {
+        spawn_tcp_server(move |_, mut stream| {
+            let Some(req) = read_request(&mut stream) else {
+                return;
+            };
+            handler(stream, &req);
+        })
+    }
+
+    fn spawn_tcp_server(handler: impl Fn(&str, TcpStream) + Send + Sync + 'static) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let handler = Arc::new({
             let base = base.clone();
-            move |req: &Request| handler(&base, req)
+            move |stream: TcpStream| handler(&base, stream)
         });
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
                 let handler = Arc::clone(&handler);
-                thread::spawn(move || serve_connection(stream, &*handler));
+                thread::spawn(move || handler(stream));
             }
         });
         base
     }
 
-    fn serve_connection(mut stream: TcpStream, handler: &dyn Fn(&Request) -> Reply) {
+    fn read_request(stream: &mut TcpStream) -> Option<Request> {
         let mut reader = StdBufReader::new(stream.try_clone().unwrap());
         let mut line = String::new();
         if reader.read_line(&mut line).is_err() || line.is_empty() {
-            return;
+            return None;
         }
         let mut parts = line.split_whitespace();
         let method = parts.next().unwrap_or_default().to_owned();
@@ -823,13 +914,16 @@ mod tests {
         }
         let mut body = vec![0; length];
         let _ = reader.read_exact(&mut body);
-        let reply = handler(&Request {
+        Some(Request {
             method,
             path,
             auth,
             text: String::from_utf8_lossy(&body).into_owned(),
             body: serde_json::from_slice(&body).unwrap_or(Value::Null),
-        });
+        })
+    }
+
+    fn write_reply(stream: &mut TcpStream, reply: Reply) {
         let headers: String = reply
             .headers
             .iter()
@@ -842,6 +936,18 @@ mod tests {
             reply.body.len(),
             reply.body
         );
+    }
+
+    fn start_sse(stream: &mut TcpStream) {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nMcp-Session-Id: {SESSION_ID}\r\nConnection: close\r\n\r\n"
+        );
+        let _ = stream.flush();
+    }
+
+    fn send_sse(stream: &mut TcpStream, payload: &Value) -> bool {
+        write!(stream, "data: {payload}\n\n").is_ok() && stream.flush().is_ok()
     }
 
     fn http_config(base: &str, headers: &[(&str, &str)]) -> ServerConfig {
@@ -1342,6 +1448,144 @@ mod tests {
 
         assert_eq!(cancelled_id, Some(call_id));
         drop(release_tx);
+    }
+
+    #[tokio::test]
+    async fn progress_streaming_call_runs_past_timeout() {
+        let base = spawn_stream_server(|mut stream, req| {
+            if req.body["method"].as_str() != Some("tools/call") {
+                write_reply(&mut stream, mcp_reply(req));
+                return;
+            }
+            let id = req.body["id"].clone();
+            let token = req.body["params"]["_meta"]["progressToken"].clone();
+            start_sse(&mut stream);
+            for step in 1..=PROGRESS_STEPS {
+                thread::sleep(PROGRESS_STEP_DELAY);
+                let progress = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {"progressToken": token, "progress": step as f64},
+                });
+                assert!(send_sse(&mut stream, &progress));
+            }
+            let result = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {"content": [{"type": "text", "text": TOOL_TEXT}]},
+            });
+            assert!(send_sse(&mut stream, &result));
+        });
+
+        let mut connection = connect(&http_config(&base, &[]), None).await.unwrap();
+        connection.timeout = WATCHDOG_TIMEOUT;
+        let text = connection.call_tool("echo", &json!({})).await.unwrap();
+        assert_eq!(text, TOOL_TEXT);
+    }
+
+    #[tokio::test]
+    async fn silent_frozen_call_times_out_and_cancels() {
+        let (entered_tx, mut entered_rx) = unbounded_channel();
+        let (cancelled_tx, mut cancelled_rx) = unbounded_channel();
+        let (release_tx, release_rx) = channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let base = spawn_stream_server(move |mut stream, req| match req.body["method"].as_str() {
+            Some("tools/call") => {
+                let _ = entered_tx.send(req.body["id"].clone());
+                start_sse(&mut stream);
+                let _ = release_rx.lock().unwrap().recv_timeout(TIMEOUT);
+            }
+            Some("notifications/cancelled") => {
+                let _ = cancelled_tx.send(req.body["params"]["requestId"].clone());
+                write_reply(&mut stream, mcp_reply(req));
+            }
+            _ => write_reply(&mut stream, mcp_reply(req)),
+        });
+
+        let mut connection = connect(&http_config(&base, &[]), None).await.unwrap();
+        connection.timeout = WATCHDOG_TIMEOUT;
+        let err = connection.call_tool("echo", &json!({})).await.unwrap_err();
+        let call_id = timeout(TIMEOUT, entered_rx.recv()).await.unwrap().unwrap();
+        let cancelled_id = timeout(TIMEOUT, cancelled_rx.recv()).await.ok().flatten();
+        let _ = release_tx.send(());
+
+        assert!(
+            matches!(
+                err,
+                McpError::Timeout { ref server, timeout_ms }
+                    if server == SERVER && timeout_ms == WATCHDOG_TIMEOUT.as_millis() as u64
+            ),
+            "got: {err:?}"
+        );
+        assert_eq!(cancelled_id, Some(call_id));
+        assert!(
+            timeout(NO_EXTRA_CANCEL_WAIT, cancelled_rx.recv())
+                .await
+                .is_err(),
+            "{DUPLICATE_CANCEL_MSG}"
+        );
+    }
+
+    #[tokio::test]
+    async fn infinite_progress_stream_hits_max_total_timeout_and_cancels() {
+        let (entered_tx, mut entered_rx) = unbounded_channel();
+        let (cancelled_tx, mut cancelled_rx) = unbounded_channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let base = spawn_stream_server({
+            let stop = Arc::clone(&stop);
+            move |mut stream, req| match req.body["method"].as_str() {
+                Some("tools/call") => {
+                    let _ = entered_tx.send(req.body["id"].clone());
+                    let token = req.body["params"]["_meta"]["progressToken"].clone();
+                    start_sse(&mut stream);
+                    let mut step = 1u64;
+                    while !stop.load(Ordering::Acquire) {
+                        thread::sleep(INFINITE_PROGRESS_STEP);
+                        let progress = json!({
+                            "jsonrpc": "2.0",
+                            "method": "notifications/progress",
+                            "params": {"progressToken": token, "progress": step as f64},
+                        });
+                        if !send_sse(&mut stream, &progress) {
+                            break;
+                        }
+                        step += 1;
+                    }
+                }
+                Some("notifications/cancelled") => {
+                    stop.store(true, Ordering::Release);
+                    let _ = cancelled_tx.send(req.body["params"]["requestId"].clone());
+                    write_reply(&mut stream, mcp_reply(req));
+                }
+                _ => write_reply(&mut stream, mcp_reply(req)),
+            }
+        });
+
+        let mut connection = connect(&http_config(&base, &[]), None).await.unwrap();
+        connection.timeout = WATCHDOG_TIMEOUT;
+        let err = connection
+            .call_tool_with_max_timeout("echo", &json!({}), MAX_TOTAL_TEST_TIMEOUT)
+            .await
+            .unwrap_err();
+        stop.store(true, Ordering::Release);
+        let call_id = timeout(TIMEOUT, entered_rx.recv()).await.unwrap().unwrap();
+        let cancelled_id = timeout(TIMEOUT, cancelled_rx.recv()).await.ok().flatten();
+
+        assert!(
+            matches!(
+                err,
+                McpError::Timeout { ref server, timeout_ms }
+                    if server == SERVER && timeout_ms == MAX_TOTAL_TEST_TIMEOUT.as_millis() as u64
+            ),
+            "got: {err:?}"
+        );
+        assert_eq!(cancelled_id, Some(call_id));
+        assert!(
+            timeout(NO_EXTRA_CANCEL_WAIT, cancelled_rx.recv())
+                .await
+                .is_err(),
+            "{DUPLICATE_CANCEL_MSG}"
+        );
     }
 
     #[tokio::test]
